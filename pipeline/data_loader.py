@@ -10,10 +10,11 @@ SEASON_FILES = {
     "2022-23": "NHL_2022-23_cleaned.csv",
     "2023-24": "NHL_2023-24_cleaned.csv",
     "2024-25": "NHL_2024-25_cleaned.csv",
+    "2025-26": "NHL_2025-26_cleaned.csv",
 }
 
-TRAIN_SEASONS = ["2021-22", "2022-23", "2023-24"]
-TEST_SEASON = "2024-25"
+TRAIN_SEASONS  = ["2021-22", "2022-23", "2023-24", "2024-25"]
+PREDICT_SEASON = "2025-26"
 
 
 def load_season(season: str) -> pd.DataFrame:

@@ -1,9 +1,12 @@
 """
 NHL Home Game Outcome Predictor — end-to-end pipeline.
 
-Usage:
-    python main.py
-    python main.py --team VEG --game 5
+Usage
+─────
+  python main.py                          # train + live validation only
+  python main.py --predict                # train + predict next upcoming games
+  python main.py --predict --bankroll 500 # with custom bankroll (default $1000)
+  python main.py --predict --date 2026-03-25  # predict for a specific date
 """
 
 import argparse
@@ -13,122 +16,254 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-from pipeline import data_loader, features, noise_reduction, calibration
+from pipeline import data_loader, features, noise_reduction, calibration, betting
 from models import train, evaluate
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NHL Home Game Predictor")
-    p.add_argument("--team", type=str, default=None, help="Team abbreviation (e.g. VEG)")
-    p.add_argument("--game", type=int, default=None, help="Game number in season")
+    p.add_argument("--predict",   action="store_true", help="Run prediction mode for upcoming games")
+    p.add_argument("--bankroll",  type=float, default=1000.0, help="Bankroll in dollars (default: 1000)")
+    p.add_argument("--date",      type=str,   default=None,   help="Predict for date YYYY-MM-DD (default: next available)")
+    p.add_argument("--team",      type=str,   default=None,   help="Single-game: team abbreviation")
+    p.add_argument("--game",      type=int,   default=None,   help="Single-game: game number in season")
     return p
+
+
+def _ensemble_probs(calibrated: dict, game_row: pd.Series, df_ref: pd.DataFrame) -> dict:
+    """
+    Run every (window, model) combination on one game row.
+    Returns {label: probability} and the ensemble mean.
+    """
+    all_probs: dict[str, float] = {}
+    for w, models in calibrated.items():
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_ref) if c in df_ref.columns]
+        X = game_row[feat_cols].to_frame().T
+        for name, model in models.items():
+            try:
+                p = float(model.predict_proba(X)[0][1])
+                all_probs[f"{name}  N={w}"] = p
+            except Exception:
+                pass
+    return all_probs
 
 
 def main():
     args = build_parser().parse_args()
 
-    # ── 1. Load data ────────────────────────────────────────────────────────
+    # ── 1. Load ALL seasons (2021-22 through 2025-26) ────────────────────────
     print("Loading data...")
     df_all = data_loader.load_all_seasons()
-    df_train_raw = df_all[df_all["season"].isin(data_loader.TRAIN_SEASONS)].copy()
-    df_test_raw = df_all[df_all["season"] == data_loader.TEST_SEASON].copy()
 
-    if df_test_raw.empty:
-        print("WARNING: 2024-25 season data not found. Evaluation will be skipped.")
-
-    # ── 2. Feature engineering ───────────────────────────────────────────────
+    # ── 2. Feature engineering on the full dataset ───────────────────────────
+    #   Rolling features use shift(1), so upcoming games (NaN result) get
+    #   correct feature vectors computed from all prior played games.
     print("Engineering features...")
     df_all_fe = features.build_features(df_all)
-    df_train_fe = df_all_fe[df_all_fe["season"].isin(data_loader.TRAIN_SEASONS)].copy()
-    df_test_fe = df_all_fe[df_all_fe["season"] == data_loader.TEST_SEASON].copy()
 
-    # ── 3. Noise reduction ───────────────────────────────────────────────────
+    # ── 3. Noise reduction — fit on all played rows, apply everywhere ─────────
     print("Applying noise reduction...")
-    df_train_fe = noise_reduction.apply(df_train_fe)
-    if not df_test_fe.empty:
-        df_test_fe = noise_reduction.apply(df_test_fe)
+    played_mask = df_all_fe["result"].notna()
+    df_all_fe.loc[played_mask] = noise_reduction.apply(df_all_fe[played_mask].copy())
 
-    # ── 4. Prepare training data ─────────────────────────────────────────────
-    feat_cols = features.get_feature_cols(df_train_fe)
-    # Use the largest window's features for training
-    train_feat_cols = evaluate.get_feature_cols_for_window(20, df_train_fe)
-    train_feat_cols = [c for c in train_feat_cols if c in df_train_fe.columns]
+    # Split
+    df_train_fe   = df_all_fe[df_all_fe["season"].isin(data_loader.TRAIN_SEASONS)].copy()
+    df_predict_fe = df_all_fe[df_all_fe["season"] == data_loader.PREDICT_SEASON].copy()
 
     y_train = df_train_fe["result"].eq("W").astype(int)
-    X_train = df_train_fe[train_feat_cols].copy()
 
-    valid_idx = X_train.notna().all(axis=1)
-    X_train = X_train[valid_idx]
-    y_train = y_train[valid_idx]
+    # ── 4. Train one set of models per window ────────────────────────────────
+    print(f"\nTraining on {len(df_train_fe)} games across {data_loader.TRAIN_SEASONS}")
+    nan_rows = df_train_fe[[c for c in df_train_fe.columns if c.startswith("rolling_")]].isna().any(axis=1).sum()
+    print(f"  ({nan_rows} rows with NaN — handled by imputer in each pipeline)\n")
 
-    print(f"Training on {len(X_train)} games across {data_loader.TRAIN_SEASONS}...")
+    all_models: dict = {}
+    for w in evaluate.WINDOWS:
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
+        print(f"── Window N={w} | {len(feat_cols)} features ──────────────────────────")
+        all_models[w] = train.train_all(df_train_fe[feat_cols], y_train)
 
-    # ── 5. Train models ──────────────────────────────────────────────────────
-    print("\nTraining models...")
-    models = train.train_all(X_train, y_train)
-
-    # ── 6. Calibrate (use last 20% of training data as calibration set) ──────
+    # ── 5. Calibrate per window ───────────────────────────────────────────────
     print("\nCalibrating models...")
-    cal_split = int(len(X_train) * 0.8)
-    X_cal = X_train.iloc[cal_split:]
-    y_cal = y_train.iloc[cal_split:]
-    X_fit = X_train.iloc[:cal_split]
-    y_fit = y_train.iloc[:cal_split]
+    cal_split = int(len(df_train_fe) * 0.8)
+    calibrated: dict = {}
 
-    calibrated_models = {}
-    for name, model in models.items():
-        try:
-            cal_model = calibration.calibrate(model, X_cal, y_cal, method="sigmoid")
-            calibrated_models[name] = cal_model
-        except Exception as e:
-            print(f"  [{name}] calibration failed ({e}), using raw model.")
-            calibrated_models[name] = model
+    for w, models in all_models.items():
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
+        X_cal = df_train_fe[feat_cols].iloc[cal_split:]
+        y_cal = y_train.iloc[cal_split:]
+        print(f"  N={w}:")
+        calibrated[w] = {name: calibration.calibrate(m, X_cal, y_cal) for name, m in models.items()}
 
-    # ── 7. Sliding window evaluation ─────────────────────────────────────────
-    if not df_test_fe.empty:
-        print("\nRunning sliding window evaluation on 2024-25 season...")
-        results = evaluate.sliding_window_evaluation(calibrated_models, df_test_fe, windows=[20])
+    # ── 6. Threshold optimisation ─────────────────────────────────────────────
+    print("\nOptimising decision thresholds (F-0.5)...")
+    for w, models in calibrated.items():
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
+        X_cal = df_train_fe[feat_cols].iloc[cal_split:]
+        y_cal = y_train.iloc[cal_split:]
+        for name, model in list(models.items()):
+            t = evaluate.find_optimal_threshold(model, X_cal, y_cal, beta=0.5)
+            calibrated[w][name] = evaluate.ThresholdedModel(model, t)
+            print(f"  N={w} {name}: threshold={t:.3f}")
 
-        if not results.empty:
-            print("\n── Accuracy by Model & Window ──")
-            pivot = evaluate.best_config_table(results)
-            print(pivot.to_string())
-
-            best_row = results.loc[results["accuracy"].idxmax()]
-            best_model_name = best_row["model"]
-            best_window = int(best_row["window"])
-            print(
-                f"\nBest config: {best_model_name} | N={best_window} | "
-                f"Accuracy={best_row['accuracy']:.4f} | ROC-AUC={best_row['roc_auc']:.4f}"
-            )
-        else:
-            print("No evaluation results (likely missing test features).")
+    # ── 7. Live validation on played 2025-26 games ───────────────────────────
+    df_live = df_predict_fe[df_predict_fe["result"].notna()].copy()
+    if not df_live.empty:
+        print(f"\nLive validation on {len(df_live)} played 2025-26 games...")
+        results = evaluate.sliding_window_evaluation(calibrated, df_live)
+        evaluate.print_results(results)
     else:
         results = pd.DataFrame()
-        best_model_name = "XGBoost"
-        best_window = 10
+        print("\nNo played 2025-26 games found for live validation.")
 
-    # ── 8. Single-game prediction ────────────────────────────────────────────
-    if args.team and args.game is not None and not df_test_fe.empty:
-        team_games = df_test_fe[
-            (df_test_fe["team"] == args.team) & (df_test_fe["game_num"] == args.game)
-        ]
-        if team_games.empty:
-            print(f"\nNo game found for team={args.team}, game={args.game} in 2024-25.")
-        else:
-            game_row = team_games.iloc[0]
-            model = calibrated_models.get(best_model_name, list(calibrated_models.values())[0])
-            feat_cols_w = evaluate.get_feature_cols_for_window(best_window, df_test_fe)
-            feat_cols_w = [c for c in feat_cols_w if c in df_test_fe.columns]
+    # ── 8. Predict upcoming games ─────────────────────────────────────────────
+    if not args.predict:
+        return
 
-            result = evaluate.predict_game(model, game_row, feat_cols_w)
-            actual = "W" if game_row["result"] == "W" else "L"
-            correct = "✓" if (result["prediction"] == "WIN") == (actual == "W") else "✗"
+    upcoming = df_predict_fe[df_predict_fe["result"].isna()].sort_values("date")
+    if upcoming.empty:
+        print("\nNo upcoming games found in 2025-26 data.")
+        return
 
-            print(f"\nPREDICTION — Game {args.game}: {args.team} vs {game_row['opponent']} ({game_row['date'].date()})")
-            print(f"  Model: {best_model_name} | Window: N={best_window}")
-            print(f"  Prediction: {args.team} {result['prediction']} (home) | Confidence: {result['confidence']*100:.1f}%")
-            print(f"  Actual Result: {actual} {correct}")
+    if args.date:
+        target_date = pd.Timestamp(args.date)
+    else:
+        target_date = upcoming["date"].min()
+
+    next_games = upcoming[upcoming["date"] == target_date]
+    if next_games.empty:
+        print(f"\nNo upcoming games on {target_date.date()}.")
+        return
+
+    # Determine best window from live validation (highest accuracy)
+    if not results.empty:
+        best_row    = results.loc[results["accuracy"].idxmax()]
+        best_window = int(best_row["window"])
+        best_model  = best_row["model"]
+        print(f"\nBest validated config: {best_model} | N={best_window} "
+              f"| acc={best_row['accuracy']:.3f} | AUC={best_row['roc_auc']:.3f}")
+    else:
+        best_window = 20
+        best_model  = "XGBoost"
+
+    print(f"\n{'═'*68}")
+    print(f"  NHL PREDICTIONS — {target_date.date()}  "
+          f"| Bankroll: ${args.bankroll:,.0f}")
+    print(f"{'═'*68}")
+
+    bet_summary = []
+
+    for _, game in next_games.iterrows():
+        # Ensemble probabilities across ALL windows and models
+        all_probs = _ensemble_probs(calibrated, game, df_all_fe)
+        if not all_probs:
+            print(f"\n  {game['team']} vs {game['opponent']}: features unavailable, skipping.")
+            continue
+
+        ensemble_p   = float(np.mean(list(all_probs.values())))
+        n_win        = sum(1 for p in all_probs.values() if p >= 0.5)
+        consensus    = f"{n_win}/{len(all_probs)} models predict WIN"
+        prediction   = "WIN" if ensemble_p >= 0.5 else "LOSS"
+        conf_flag    = "▲ HIGH" if abs(ensemble_p - 0.5) > 0.08 else ("▶ MED" if abs(ensemble_p - 0.5) > 0.04 else "▼ LOW")
+
+        # Per-window average (cleaner breakdown than 16 rows)
+        window_avgs = {}
+        for w in evaluate.WINDOWS:
+            w_probs = {k: v for k, v in all_probs.items() if f"N={w}" in k}
+            if w_probs:
+                window_avgs[f"N={w} avg"] = float(np.mean(list(w_probs.values())))
+
+        print(f"\n  {'─'*64}")
+        game_num_str = f"Game #{int(game['game_num'])}" if pd.notna(game['game_num']) else ""
+        print(f"  {game['team']:4s} (home) vs {game['opponent']:4s}  "
+              f"{game_num_str}  | Confidence: {conf_flag}")
+        print(f"  {'─'*64}")
+        print(f"  Ensemble probability : {ensemble_p:>6.1%}  →  predicted {prediction}")
+        print(f"  Model consensus      : {consensus}")
+        print(f"  Window breakdown     : " +
+              "  ".join(f"{k}: {v:.1%}" for k, v in window_avgs.items()))
+
+        def _parse_odds(prompt):
+            raw = input(prompt).strip()
+            if not raw:
+                return None
+            try:
+                val = float(raw)
+                if val <= 1.0:
+                    raise ValueError
+                return val
+            except ValueError:
+                print("  Invalid odds — must be a decimal > 1.0. Skipping.")
+                return None
+
+        home_odds = _parse_odds(
+            f"\n  Enter {game['team']} (home) decimal odds   (Enter to skip): ")
+        away_odds = _parse_odds(
+            f"  Enter {game['opponent']} (away) decimal odds  (Enter to skip): ")
+
+        if home_odds is None and away_odds is None:
+            print("  [skipped]")
+            continue
+
+        p_home = ensemble_p
+        p_away = 1.0 - ensemble_p
+
+        print()
+        for side, p, odds, label in [
+            (game['team'],     p_home, home_odds, "home"),
+            (game['opponent'], p_away, away_odds, "away"),
+        ]:
+            if odds is None:
+                continue
+            imp        = betting.implied_prob(odds)
+            ev         = betting.expected_value(p, odds)
+            kf         = betting.kelly_fraction(p, odds)
+            edg        = betting.edge(p, odds)
+            stake_full = kf * args.bankroll
+            stake_half = kf * 0.5 * args.bankroll
+            bet_flag   = "✓ BET" if ev > 0 else "✗ SKIP"
+
+            print(f"  ── {side} ({label}) ──────────────────────────────────────")
+            print(f"  Win probability      : {p:.1%}")
+            print(f"  Decimal odds         : {odds:.2f}")
+            print(f"  Book implied prob    : {imp:.1%}")
+            print(f"  Your edge            : {edg:+.1%}")
+            print(f"  Expected value       : {ev:+.1%}   {bet_flag}")
+            if ev > 0:
+                print(f"  Full Kelly stake     : {kf:.1%}   (${stake_full:,.2f})")
+                print(f"  Half Kelly stake     : {kf*0.5:.1%}   (${stake_half:,.2f})"
+                      f"  ← recommended")
+                bet_summary.append({
+                    "matchup":    f"{side} ({label})",
+                    "prob":       p,
+                    "odds":       odds,
+                    "ev":         ev,
+                    "full_kelly": stake_full,
+                    "half_kelly": stake_half,
+                })
+            print()
+
+    # ── Betting summary ───────────────────────────────────────────────────────
+    if bet_summary:
+        total_half = sum(s["half_kelly"] for s in bet_summary)
+        total_full = sum(s["full_kelly"] for s in bet_summary)
+        print(f"\n{'═'*68}")
+        print(f"  BETTING SUMMARY — {target_date.date()}")
+        print(f"{'═'*68}")
+        print(f"  Positive-EV bets   : {len(bet_summary)}")
+        print(f"  Total half-Kelly   : ${total_half:,.2f}  "
+              f"({total_half/args.bankroll:.1%} of bankroll)")
+        print(f"  Total full-Kelly   : ${total_full:,.2f}  "
+              f"({total_full/args.bankroll:.1%} of bankroll)")
+        print(f"\n  {'Team (side)':<26} {'P(win)':>7} {'Odds':>6} {'EV%':>7}"
+              f" {'½Kelly%':>8} {'Stake':>10}")
+        print(f"  {'─'*70}")
+        for s in sorted(bet_summary, key=lambda x: x["ev"], reverse=True):
+            print(f"  {s['matchup']:<26} {s['prob']:>7.1%} {s['odds']:>6.2f}"
+                  f" {s['ev']:>+7.1%} {s['half_kelly']/args.bankroll:>8.1%}"
+                  f" ${s['half_kelly']:>9.2f}")
+    elif args.predict:
+        print(f"\n  No positive-EV bets found for {target_date.date()}.")
 
 
 if __name__ == "__main__":

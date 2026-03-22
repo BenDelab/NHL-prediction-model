@@ -1,98 +1,135 @@
-"""Evaluation with sliding window validation on the 2024-25 season."""
+"""Evaluation with per-window sliding validation on the 2024-25 season."""
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    brier_score_loss,
-    log_loss,
-    roc_auc_score,
+    accuracy_score, precision_score, recall_score,
+    f1_score, brier_score_loss, log_loss, roc_auc_score,
+    precision_recall_curve,
 )
+
+
+class ThresholdedModel:
+    """Wraps a fitted model with a custom decision threshold."""
+    def __init__(self, model, threshold: float):
+        self._model = model
+        self.threshold = threshold
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= self.threshold).astype(int)
+
+    def predict_proba(self, X):
+        return self._model.predict_proba(X)
+
+
+def find_optimal_threshold(model, X_cal, y_cal, beta: float = 0.5) -> float:
+    """
+    Find the decision threshold that maximises F-beta on the calibration set.
+    beta < 1 weights precision more than recall (beta=0.5 means precision 2x more important).
+    Returns the optimal threshold.
+    """
+    probs = model.predict_proba(X_cal)[:, 1]
+    precisions, recalls, thresholds = precision_recall_curve(y_cal, probs)
+
+    # F-beta = (1 + beta²) * P * R / (beta² * P + R)
+    b2 = beta ** 2
+    with np.errstate(invalid="ignore"):
+        f_beta = (1 + b2) * precisions * recalls / (b2 * precisions + recalls + 1e-9)
+
+    best_idx = np.argmax(f_beta[:-1])  # last point has no corresponding threshold
+    return float(thresholds[best_idx])
 
 WINDOWS = [5, 10, 15, 20]
 
-
-def _rolling_feature_cols(window: int, df: pd.DataFrame) -> list:
-    prefix = f"rolling_{window}_"
-    return [c for c in df.columns if c.startswith(prefix) or c.startswith(f"opp_rolling_{window}_")]
+METRIC_COLS = ["accuracy", "roc_auc", "precision", "recall", "f1", "brier", "log_loss"]
 
 
 def get_feature_cols_for_window(window: int, df: pd.DataFrame) -> list:
-    """Return feature columns that correspond to a given rolling window N."""
-    rolling_cols = _rolling_feature_cols(window, df)
-    static_cols = [
+    """Feature columns for a given rolling window N (home + opponent + static)."""
+    prefix   = f"rolling_{window}_"
+    opp_pref = f"opp_rolling_{window}_"
+    rolling  = [c for c in df.columns if c.startswith(prefix) or c.startswith(opp_pref)]
+    static   = [
         "days_since_last_game", "game_number_in_season",
-        "pp_opportunity_rate", "h2h_win_pct",
+        "pp_opportunity_rate", "h2h_win_pct", "win_streak",
+        "back_to_back", "season_win_pct", "opp_season_win_pct",
+        "opp_win_streak",
+        "momentum_5v20", "momentum_5v10", "momentum_10v20",
+        "momentum_5v15", "momentum_10v15",
+        "ewm_momentum_5v20", "ewm_momentum_5v10",
     ]
-    static_cols = [c for c in static_cols if c in df.columns]
-    return rolling_cols + static_cols
+    static = [c for c in static if c in df.columns]
+    return rolling + static
 
 
-def evaluate_model_on_window(model, X_test, y_test) -> dict:
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)[:, 1]
+def _metrics(model, X, y) -> dict:
+    y_pred = model.predict(X)
+    y_prob = model.predict_proba(X)[:, 1]
     return {
-        "accuracy": accuracy_score(y_test, y_pred),
-        "precision": precision_score(y_test, y_pred, zero_division=0),
-        "recall": recall_score(y_test, y_pred, zero_division=0),
-        "f1": f1_score(y_test, y_pred, zero_division=0),
-        "brier": brier_score_loss(y_test, y_prob),
-        "log_loss": log_loss(y_test, y_prob),
-        "roc_auc": roc_auc_score(y_test, y_prob),
+        "accuracy":  accuracy_score(y, y_pred),
+        "roc_auc":   roc_auc_score(y, y_prob),
+        "precision": precision_score(y, y_pred, zero_division=0),
+        "recall":    recall_score(y, y_pred, zero_division=0),
+        "f1":        f1_score(y, y_pred, zero_division=0),
+        "brier":     brier_score_loss(y, y_prob),
+        "log_loss":  log_loss(y, y_prob),
     }
 
 
-def sliding_window_evaluation(models: dict, test_df: pd.DataFrame, windows: list = None) -> pd.DataFrame:
+def sliding_window_evaluation(models_by_window: dict, test_df: pd.DataFrame) -> pd.DataFrame:
     """
-    For each model and each window size N, evaluate on the test season.
-    Returns a summary DataFrame with one row per (model, N).
+    Evaluate per-window trained models on the test season.
+
+    models_by_window: {window_int: {model_name: fitted_model}}
+    Returns a DataFrame with one row per (model, window).
     """
-    if windows is None:
-        windows = WINDOWS
-    y_test_full = test_df["result"].eq("W").astype(int)
+    y_full = test_df["result"].eq("W").astype(int)
     records = []
 
-    for model_name, model in models.items():
-        for w in windows:
-            feat_cols = get_feature_cols_for_window(w, test_df)
-            if not feat_cols:
-                print(f"[eval] No feature cols for window {w}, skipping.")
-                continue
+    for w, models in models_by_window.items():
+        feat_cols = get_feature_cols_for_window(w, test_df)
+        feat_cols = [c for c in feat_cols if c in test_df.columns]
+        if not feat_cols:
+            print(f"  [eval] No feature cols for window {w}, skipping.")
+            continue
 
-            X_w = test_df[feat_cols].copy()
-            y_w = y_test_full.copy()
+        X_w = test_df[feat_cols]
 
-            # Drop rows with NaN features
-            valid = X_w.notna().all(axis=1)
-            X_w = X_w[valid]
-            y_w = y_w[valid]
-
-            if len(y_w) == 0:
-                continue
-
-            metrics = evaluate_model_on_window(model, X_w, y_w)
-            records.append({
-                "model": model_name,
-                "window": w,
-                **metrics,
-            })
+        for model_name, model in models.items():
+            try:
+                m = _metrics(model, X_w, y_full)
+                records.append({"model": model_name, "window": w, **m})
+            except Exception as e:
+                print(f"  [eval] {model_name} N={w} failed: {e}")
 
     return pd.DataFrame(records)
 
 
-def best_config_table(results: pd.DataFrame) -> pd.DataFrame:
-    """Return accuracy pivot table: models as rows, N as columns."""
-    pivot = results.pivot(index="model", columns="window", values="accuracy")
-    pivot.columns = [f"N={c}" for c in pivot.columns]
-    pivot["Best N"] = pivot.idxmax(axis=1)
-    return pivot
+def print_results(results: pd.DataFrame) -> None:
+    """Print a full metrics table grouped by window."""
+    if results.empty:
+        print("No results to display.")
+        return
+
+    for w in sorted(results["window"].unique()):
+        df_w = results[results["window"] == w].set_index("model")[METRIC_COLS]
+        df_w = df_w.sort_values("accuracy", ascending=False)
+        print(f"\n── Window N={w} ──────────────────────────────────────────────────────")
+        header = f"  {'Model':<22}" + "".join(f"  {c.upper():<10}" for c in METRIC_COLS)
+        print(header)
+        print("  " + "─" * (len(header) - 2))
+        for model, row in df_w.iterrows():
+            vals = "".join(f"  {row[c]:<10.4f}" for c in METRIC_COLS)
+            print(f"  {model:<22}{vals}")
+
+    print("\n── Best configuration per metric ─────────────────────────────────────")
+    best = results.loc[results["accuracy"].idxmax()]
+    print(f"  Best accuracy : {best['model']} | N={int(best['window'])} | "
+          f"acc={best['accuracy']:.4f} | AUC={best['roc_auc']:.4f} | "
+          f"F1={best['f1']:.4f} | Brier={best['brier']:.4f}")
 
 
 def predict_game(model, game_row: pd.Series, feature_cols: list) -> dict:
-    """Return prediction dict for a single game row."""
     X = game_row[feature_cols].values.reshape(1, -1)
     pred = model.predict(X)[0]
     prob = model.predict_proba(X)[0][1]
