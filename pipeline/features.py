@@ -27,6 +27,7 @@ def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
     tpim  = df["team_pim"].shift(1)
     ot    = df["overtime_type"].ne("REG").astype(int).shift(1)
     regw  = (df["result"].eq("W") & df["overtime_type"].eq("REG")).astype(int).shift(1)
+    otw   = (df["result"].eq("W") & df["overtime_type"].ne("REG")).astype(int).shift(1)
     shg   = df["team_shg"].shift(1)
     oshg  = df["opp_shg"].shift(1)
     shoot = (df["goals_for"] / (df["team_sog"] + 0.01)).shift(1)   # shooting %
@@ -50,6 +51,10 @@ def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
     df[f"{p}_team_pim_avg"]      = rm(tpim)   # team's own penalties (discipline)
     df[f"{p}_ot_rate"]           = rm(ot)     # rate of games going to OT/SO
     df[f"{p}_reg_win_pct"]       = rm(regw)   # wins in regulation only
+    # OT win rate: wins in OT / games that went to OT (NaN if no OT games yet → fill 0.5)
+    ot_sum  = ot.rolling(n, min_periods=1).sum()
+    otw_sum = otw.rolling(n, min_periods=1).sum()
+    df[f"{p}_ot_win_rate"]       = (otw_sum / ot_sum.replace(0, np.nan)).fillna(0.5)
     df[f"{p}_shg_rate"]          = rm(shg)    # short-handed goals scored
     df[f"{p}_opp_shg_rate"]      = rm(oshg)   # opp short-handed goals (our PK weakness)
     df[f"{p}_shooting_pct"]      = rm(shoot)  # goals / shots on goal

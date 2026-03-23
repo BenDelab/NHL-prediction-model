@@ -17,7 +17,7 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 from pipeline import data_loader, features, noise_reduction, calibration, betting
-from models import train, evaluate
+from models import train, evaluate, secondary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +146,23 @@ def main():
         best_window = 20
         best_model  = "XGBoost"
 
+    # ── 8b. Train secondary models (OT likelihood + regulation win) ───────────
+    print("\nTraining secondary models (OT / regulation win)...")
+    sec_feat_cols = [c for c in evaluate.get_feature_cols_for_window(best_window, df_train_fe)
+                     if c in df_train_fe.columns]
+    X_sec = df_train_fe[sec_feat_cols]
+
+    played_train = df_train_fe["result"].notna() & df_train_fe["overtime_type"].notna()
+    X_sec_played = X_sec[played_train]
+    y_ot      = df_train_fe.loc[played_train, "overtime_type"].ne("REG").astype(int)
+    y_reg_win = (df_train_fe.loc[played_train, "result"].eq("W") &
+                 df_train_fe.loc[played_train, "overtime_type"].eq("REG")).astype(int)
+
+    ot_model      = secondary.train_ot_model(X_sec_played, y_ot)
+    reg_win_model = secondary.train_reg_win_model(X_sec_played, y_reg_win)
+    print(f"  OT base rate (train): {y_ot.mean():.1%}  |  "
+          f"Reg-win base rate: {y_reg_win.mean():.1%}")
+
     print(f"\n{'═'*68}")
     print(f"  NHL PREDICTIONS — {target_date.date()}  "
           f"| Bankroll: ${args.bankroll:,.0f}")
@@ -182,6 +199,47 @@ def main():
         print(f"  Model consensus      : {consensus}")
         print(f"  Window breakdown     : " +
               "  ".join(f"{k}: {v:.1%}" for k, v in window_avgs.items()))
+
+        # ── OT / Regulation analysis ──────────────────────────────────────────
+        X_game = game[sec_feat_cols].to_frame().T
+        p_ot      = float(ot_model.predict_proba(X_game)[0][1])
+        p_reg_win = float(reg_win_model.predict_proba(X_game)[0][1])
+
+        # Pull per-team OT profile from the best-window rolling features
+        bw = best_window
+        home_ot_rate     = game.get(f"rolling_{bw}_ot_rate",     np.nan)
+        home_ot_win_rate = game.get(f"rolling_{bw}_ot_win_rate", np.nan)
+        away_ot_rate     = game.get(f"opp_rolling_{bw}_ot_rate",     np.nan)
+        away_ot_win_rate = game.get(f"opp_rolling_{bw}_ot_win_rate", np.nan)
+
+        ot_flag = ("▲ ELEVATED" if p_ot >= 0.33
+                   else ("▶ POSSIBLE" if p_ot >= 0.22 else "▼ UNLIKELY"))
+
+        print(f"\n  ── OT / Regulation Analysis ─────────────────────────────")
+        print(f"  P(OT/SO)             : {p_ot:>6.1%}  {ot_flag}")
+
+        if p_ot < 0.30:
+            print(f"  → Low OT risk — regulation win probability: {p_reg_win:.1%}")
+        else:
+            # Show per-team OT profiles
+            def _fmt(v): return f"{v:.1%}" if pd.notna(v) and not np.isnan(float(v)) else "N/A"
+            print(f"  → OT possible — team OT profiles (last {bw} games):")
+            print(f"    {game['team']:4s}  OT rate: {_fmt(home_ot_rate)}"
+                  f"   OT win rate: {_fmt(home_ot_win_rate)}")
+            print(f"    {game['opponent']:4s}  OT rate: {_fmt(away_ot_rate)}"
+                  f"   OT win rate: {_fmt(away_ot_win_rate)}")
+
+            # Net OT edge: if home team wins OT more often, note it
+            if (pd.notna(home_ot_win_rate) and pd.notna(away_ot_win_rate)
+                    and not np.isnan(float(home_ot_win_rate))
+                    and not np.isnan(float(away_ot_win_rate))):
+                net_ot = float(home_ot_win_rate) - float(away_ot_win_rate)
+                if abs(net_ot) >= 0.10:
+                    leader = game['team'] if net_ot > 0 else game['opponent']
+                    print(f"    OT edge: {leader} ({net_ot:+.1%} net OT win rate)")
+
+            print(f"  Regulation win prob  : {p_reg_win:.1%}"
+                  f"  (if game stays in regulation)")
 
         def _parse_odds(prompt):
             raw = input(prompt).strip()
