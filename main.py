@@ -17,7 +17,7 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 from pipeline import data_loader, features, noise_reduction, calibration, betting
-from models import train, evaluate, secondary
+from models import train, evaluate, secondary, totals
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,6 +28,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--team",      type=str,   default=None,   help="Single-game: team abbreviation")
     p.add_argument("--game",      type=int,   default=None,   help="Single-game: game number in season")
     return p
+
+
+def _spread_ensemble_prob(models_by_window: dict, game_row: pd.Series,
+                          df_ref: pd.DataFrame) -> float:
+    """Average calibrated spread probability across all windows and models."""
+    probs = []
+    for w, models in models_by_window.items():
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_ref)
+                     if c in df_ref.columns]
+        X = game_row[feat_cols].to_frame().T
+        for model in models.values():
+            try:
+                probs.append(float(model.predict_proba(X)[0][1]))
+            except Exception:
+                pass
+    return float(np.mean(probs)) if probs else 0.5
+
+
+def _goals_ensemble_pred(models_by_window: dict, game_row: pd.Series,
+                         df_ref: pd.DataFrame) -> float:
+    """Average regression prediction across all windows and models."""
+    preds = []
+    for w, models in models_by_window.items():
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_ref)
+                     if c in df_ref.columns]
+        X = game_row[feat_cols].to_frame().T
+        for model in models.values():
+            try:
+                preds.append(float(model.predict(X)[0]))
+            except Exception:
+                pass
+    return float(np.mean(preds)) if preds else 5.5
 
 
 def _ensemble_probs(calibrated: dict, game_row: pd.Series, df_ref: pd.DataFrame) -> dict:
@@ -163,6 +195,56 @@ def main():
     print(f"  OT base rate (train): {y_ot.mean():.1%}  |  "
           f"Reg-win base rate: {y_reg_win.mean():.1%}")
 
+    # ── 8c. Train totals / spread models (multi-window, calibrated ensemble) ──
+    print("\nTraining spread / totals models (4 windows × 3 models each)...")
+    played_all = (df_train_fe["result"].notna() &
+                  df_train_fe["goals_for"].notna() &
+                  df_train_fe["team_sog"].notna())
+    df_played = df_train_fe[played_all]
+
+    y_home_spread = (df_played["goals_for"] - df_played["goals_against"] >= 2).astype(int)
+    y_away_spread = (df_played["goals_against"] - df_played["goals_for"] >= 2).astype(int)
+    y_total_goals = df_played["goals_for"] + df_played["goals_against"]
+    print(f"  Home -1.5 base rate: {y_home_spread.mean():.1%}  |  "
+          f"Away -1.5 base rate: {y_away_spread.mean():.1%}  |  "
+          f"Avg total goals: {y_total_goals.mean():.1f}")
+
+    home_spread_by_window: dict = {}
+    away_spread_by_window: dict = {}
+    total_goals_by_window: dict = {}
+
+    for w in evaluate.WINDOWS:
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe)
+                     if c in df_train_fe.columns]
+        X_w = df_played[feat_cols]
+        print(f"  ── Window N={w} ─────────────────────────────────────────")
+        print(f"    [spread home]")
+        home_spread_by_window[w] = totals.train_spread_ensemble(X_w, y_home_spread)
+        print(f"    [spread away]")
+        away_spread_by_window[w] = totals.train_spread_ensemble(X_w, y_away_spread)
+        print(f"    [goals regression]")
+        total_goals_by_window[w] = totals.train_regression_all(X_w, y_total_goals)
+
+    # Calibrate spread models (goals regression doesn't output probabilities)
+    print("\n  Calibrating spread models...")
+    for w in evaluate.WINDOWS:
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe)
+                     if c in df_train_fe.columns]
+        X_w       = df_played[feat_cols]
+        cal_split = int(len(X_w) * 0.8)
+        X_cal     = X_w.iloc[cal_split:]
+        y_home_cal = y_home_spread.iloc[cal_split:]
+        y_away_cal = y_away_spread.iloc[cal_split:]
+        home_spread_by_window[w] = {
+            name: calibration.calibrate(m, X_cal, y_home_cal)
+            for name, m in home_spread_by_window[w].items()
+        }
+        away_spread_by_window[w] = {
+            name: calibration.calibrate(m, X_cal, y_away_cal)
+            for name, m in away_spread_by_window[w].items()
+        }
+        print(f"    N={w}: spread calibrated")
+
     print(f"\n{'═'*68}")
     print(f"  NHL PREDICTIONS — {target_date.date()}  "
           f"| Bankroll: ${args.bankroll:,.0f}")
@@ -241,6 +323,16 @@ def main():
             print(f"  Regulation win prob  : {p_reg_win:.1%}"
                   f"  (if game stays in regulation)")
 
+        # ── Totals / Spread analysis ──────────────────────────────────────────
+        p_home_spread    = _spread_ensemble_prob(home_spread_by_window, game, df_all_fe)
+        p_away_spread    = _spread_ensemble_prob(away_spread_by_window, game, df_all_fe)
+        pred_total_goals = _goals_ensemble_pred(total_goals_by_window, game, df_all_fe)
+
+        print(f"\n  ── Totals / Spread ──────────────────────────────────────")
+        print(f"  P({game['team']:4s} covers -1.5)       : {p_home_spread:.1%}")
+        print(f"  P({game['opponent']:4s} covers -1.5)       : {p_away_spread:.1%}")
+        print(f"  Predicted total goals       : {pred_total_goals:.1f}")
+
         def _parse_odds(prompt):
             raw = input(prompt).strip()
             if not raw:
@@ -254,25 +346,46 @@ def main():
                 print("  Invalid odds — must be a decimal > 1.0. Skipping.")
                 return None
 
-        home_odds = _parse_odds(
-            f"\n  Enter {game['team']} (home) decimal odds   (Enter to skip): ")
-        away_odds = _parse_odds(
-            f"  Enter {game['opponent']} (away) decimal odds  (Enter to skip): ")
+        def _parse_line(prompt):
+            raw = input(prompt).strip()
+            if not raw:
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                print("  Invalid line — must be a number. Skipping.")
+                return None
 
-        if home_odds is None and away_odds is None:
+        # ── Moneyline odds ────────────────────────────────────────────────────
+        home_odds = _parse_odds(
+            f"\n  [Moneyline] {game['team']} (home) decimal odds   (Enter to skip): ")
+        away_odds = _parse_odds(
+            f"  [Moneyline] {game['opponent']} (away) decimal odds  (Enter to skip): ")
+
+        # ── Spread (puck line -1.5) odds — each side independent ─────────────
+        home_spread_odds = _parse_odds(
+            f"  [Spread]    {game['team']} -1.5 decimal odds        (Enter to skip): ")
+        away_spread_odds = _parse_odds(
+            f"  [Spread]    {game['opponent']} -1.5 decimal odds     (Enter to skip): ")
+
+        # ── Total goals line + over/under odds ────────────────────────────────
+        goals_line      = _parse_line(
+            f"  [Goals O/U] Book's total-goals line  (e.g. 5.5, Enter to skip): ")
+        goals_over_odds = goals_under_odds = None
+        if goals_line is not None:
+            goals_over_odds  = _parse_odds(f"    OVER  {goals_line} decimal odds: ")
+            goals_under_odds = _parse_odds(f"    UNDER {goals_line} decimal odds: ")
+
+        all_odds_skipped = all(x is None for x in [
+            home_odds, away_odds, home_spread_odds, away_spread_odds,
+            goals_over_odds, goals_under_odds,
+        ])
+        if all_odds_skipped:
             print("  [skipped]")
             continue
 
-        p_home = ensemble_p
-        p_away = 1.0 - ensemble_p
-
-        print()
-        for side, p, odds, label in [
-            (game['team'],     p_home, home_odds, "home"),
-            (game['opponent'], p_away, away_odds, "away"),
-        ]:
-            if odds is None:
-                continue
+        def _print_bet(label: str, p: float, odds: float):
+            """Print EV/Kelly for one bet side and append to bet_summary if +EV."""
             imp        = betting.implied_prob(odds)
             ev         = betting.expected_value(p, odds)
             kf         = betting.kelly_fraction(p, odds)
@@ -281,8 +394,8 @@ def main():
             stake_half = kf * 0.5 * args.bankroll
             bet_flag   = "✓ BET" if ev > 0 else "✗ SKIP"
 
-            print(f"  ── {side} ({label}) ──────────────────────────────────────")
-            print(f"  Win probability      : {p:.1%}")
+            print(f"  ── {label} ──────────────────────────────────────")
+            print(f"  Model est. prob      : {p:.1%}")
             print(f"  Decimal odds         : {odds:.2f}")
             print(f"  Book implied prob    : {imp:.1%}")
             print(f"  Your edge            : {edg:+.1%}")
@@ -292,7 +405,7 @@ def main():
                 print(f"  Half Kelly stake     : {kf*0.5:.1%}   (${stake_half:,.2f})"
                       f"  ← recommended")
                 bet_summary.append({
-                    "matchup":    f"{side} ({label})",
+                    "matchup":    label,
                     "prob":       p,
                     "odds":       odds,
                     "ev":         ev,
@@ -300,6 +413,31 @@ def main():
                     "half_kelly": stake_half,
                 })
             print()
+
+        print()
+
+        # Moneyline
+        p_home = ensemble_p
+        p_away = 1.0 - ensemble_p
+        if home_odds is not None:
+            _print_bet(f"{game['team']} ML (home)", p_home, home_odds)
+        if away_odds is not None:
+            _print_bet(f"{game['opponent']} ML (away)", p_away, away_odds)
+
+        # Spread — each side uses its own independent model
+        if home_spread_odds is not None:
+            _print_bet(f"{game['team']} -1.5 (spread)", p_home_spread, home_spread_odds)
+        if away_spread_odds is not None:
+            _print_bet(f"{game['opponent']} -1.5 (spread)", p_away_spread, away_spread_odds)
+
+        # Total goals
+        if goals_line is not None:
+            p_over_goals  = totals.prob_over_goals(pred_total_goals, goals_line)
+            p_under_goals = totals.prob_under(p_over_goals)
+            if goals_over_odds is not None:
+                _print_bet(f"Goals OVER  {goals_line}", p_over_goals, goals_over_odds)
+            if goals_under_odds is not None:
+                _print_bet(f"Goals UNDER {goals_line}", p_under_goals, goals_under_odds)
 
     # ── Betting summary ───────────────────────────────────────────────────────
     if bet_summary:
@@ -313,11 +451,11 @@ def main():
               f"({total_half/args.bankroll:.1%} of bankroll)")
         print(f"  Total full-Kelly   : ${total_full:,.2f}  "
               f"({total_full/args.bankroll:.1%} of bankroll)")
-        print(f"\n  {'Team (side)':<26} {'P(win)':>7} {'Odds':>6} {'EV%':>7}"
+        print(f"\n  {'Bet':<30} {'Est.P':>7} {'Odds':>6} {'EV%':>7}"
               f" {'½Kelly%':>8} {'Stake':>10}")
-        print(f"  {'─'*70}")
+        print(f"  {'─'*74}")
         for s in sorted(bet_summary, key=lambda x: x["ev"], reverse=True):
-            print(f"  {s['matchup']:<26} {s['prob']:>7.1%} {s['odds']:>6.2f}"
+            print(f"  {s['matchup']:<30} {s['prob']:>7.1%} {s['odds']:>6.2f}"
                   f" {s['ev']:>+7.1%} {s['half_kelly']/args.bankroll:>8.1%}"
                   f" ${s['half_kelly']:>9.2f}")
     elif args.predict:
