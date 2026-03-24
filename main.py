@@ -393,9 +393,11 @@ def main():
             stake_full = kf * args.bankroll
             stake_half = kf * 0.5 * args.bankroll
             bet_flag   = "✓ BET" if ev > 0 else "✗ SKIP"
+            dist       = abs(p - 0.5)
+            conf       = "▲ HIGH" if dist > 0.08 else ("▶ MED" if dist > 0.04 else "▼ LOW")
 
             print(f"  ── {label} ──────────────────────────────────────")
-            print(f"  Model est. prob      : {p:.1%}")
+            print(f"  Model est. prob      : {p:.1%}   {conf}")
             print(f"  Decimal odds         : {odds:.2f}")
             print(f"  Book implied prob    : {imp:.1%}")
             print(f"  Your edge            : {edg:+.1%}")
@@ -405,12 +407,14 @@ def main():
                 print(f"  Half Kelly stake     : {kf*0.5:.1%}   (${stake_half:,.2f})"
                       f"  ← recommended")
                 bet_summary.append({
+                    "game_key":   f"{game['team']} vs {game['opponent']}",
                     "matchup":    label,
                     "prob":       p,
                     "odds":       odds,
                     "ev":         ev,
                     "full_kelly": stake_full,
                     "half_kelly": stake_half,
+                    "conf":       conf,
                 })
             print()
 
@@ -451,13 +455,27 @@ def main():
               f"({total_half/args.bankroll:.1%} of bankroll)")
         print(f"  Total full-Kelly   : ${total_full:,.2f}  "
               f"({total_full/args.bankroll:.1%} of bankroll)")
-        print(f"\n  {'Bet':<30} {'Est.P':>7} {'Odds':>6} {'EV%':>7}"
-              f" {'½Kelly%':>8} {'Stake':>10}")
-        print(f"  {'─'*74}")
-        for s in sorted(bet_summary, key=lambda x: x["ev"], reverse=True):
-            print(f"  {s['matchup']:<30} {s['prob']:>7.1%} {s['odds']:>6.2f}"
-                  f" {s['ev']:>+7.1%} {s['half_kelly']/args.bankroll:>8.1%}"
-                  f" ${s['half_kelly']:>9.2f}")
+        # Group by game, preserving the order games appeared in the loop
+        seen_games: list = []
+        games_bets: dict = {}
+        for s in bet_summary:
+            gk = s["game_key"]
+            if gk not in games_bets:
+                seen_games.append(gk)
+                games_bets[gk] = []
+            games_bets[gk].append(s)
+
+        col_hdr = f"  {'Bet':<30} {'Conf':<8} {'Est.P':>7} {'Odds':>6} {'EV%':>7} {'½Kelly%':>8} {'Stake':>10}"
+        for gk in seen_games:
+            bets = sorted(games_bets[gk], key=lambda x: x["ev"], reverse=True)
+            print(f"\n  ┌─ {gk} {'─'*(max(0, 74 - len(gk)))}┐")
+            print(col_hdr)
+            print(f"  {'─'*82}")
+            for s in bets:
+                print(f"  {s['matchup']:<30} {s['conf']:<8} {s['prob']:>7.1%} {s['odds']:>6.2f}"
+                      f" {s['ev']:>+7.1%} {s['half_kelly']/args.bankroll:>8.1%}"
+                      f" ${s['half_kelly']:>9.2f}")
+            print(f"  └{'─'*82}┘")
     elif args.predict:
         print(f"\n  No positive-EV bets found for {target_date.date()}.")
 
