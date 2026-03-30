@@ -1,4 +1,19 @@
-"""Feature engineering: rolling window features per team, opponent features, and derived features."""
+"""
+Feature engineering: rolling window features per team, opponent features, and derived features.
+
+Rolling features are organised into families inside _compute_team_rolling:
+  ┌──────────────────┬───────────────────────────────────────────────────────┐
+  │ WIN_RATE         │ win%, reg win%, OT win rate, EWM win%, streaks        │
+  │ SCORING          │ goals, differentials, rates (shutout, high-scoring…)  │
+  │ SHOOTING         │ SOG, shooting%, save%, quality gap                    │
+  │ ADVANCED         │ Corsi, Fenwick, PDO, offensive-zone %                 │
+  │ SPECIAL_TEAMS    │ PP/PK efficiency, SHG, net PPG                        │
+  │ DISCIPLINE       │ PIMs, net discipline                                  │
+  │ FACEOFFS         │ faceoff%                                              │
+  │ OVERTIME         │ OT rate, conditional OT win rate                      │
+  └──────────────────┴───────────────────────────────────────────────────────┘
+All raw inputs are shift(1) to prevent data leakage.
+"""
 
 import pandas as pd
 import numpy as np
@@ -7,12 +22,12 @@ WINDOWS = [5, 10, 15, 20]
 
 
 def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
-    """Compute rolling mean + std features for a single team's games, chronological order."""
+    """Compute all rolling features for one team-season group (chronological order)."""
     df = df.sort_values("date").copy()
     n = window
     p = f"rolling_{n}"
 
-    # ── Shift all raw inputs by 1 to prevent leakage ──────────────────────────
+    # ── Raw inputs, all shifted by 1 game to prevent leakage ──────────────────
     wins  = df["result"].eq("W").astype(int).shift(1)
     gf    = df["goals_for"].shift(1)
     ga    = df["goals_against"].shift(1)
@@ -30,67 +45,111 @@ def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
     otw   = (df["result"].eq("W") & df["overtime_type"].ne("REG")).astype(int).shift(1)
     shg   = df["team_shg"].shift(1)
     oshg  = df["opp_shg"].shift(1)
-    shoot = (df["goals_for"] / (df["team_sog"] + 0.01)).shift(1)   # shooting %
-    save  = (1 - df["goals_against"] / (df["opp_sog"] + 0.01)).shift(1)  # save %
+    shoot = (df["goals_for"] / (df["team_sog"] + 0.01)).shift(1)
+    save  = (1 - df["goals_against"] / (df["opp_sog"] + 0.01)).shift(1)
 
     def rm(s): return s.rolling(n, min_periods=1).mean()
     def rs(s): return s.rolling(n, min_periods=2).std().fillna(0)
 
-    # ── Rolling means ──────────────────────────────────────────────────────────
-    df[f"{p}_win_pct"]           = rm(wins)
-    df[f"{p}_goals_for_avg"]     = rm(gf)
-    df[f"{p}_goals_against_avg"] = rm(ga)
-    df[f"{p}_sog_avg"]           = rm(sog)
-    df[f"{p}_opp_sog_avg"]       = rm(osog)
-    df[f"{p}_corsi_pct"]         = rm(cf)
-    df[f"{p}_fenwick_pct"]       = rm(ff)
-    df[f"{p}_faceoff_pct"]       = rm(fo)
-    df[f"{p}_pdo"]               = rm(pdo)
-    df[f"{p}_off_zone_avg"]      = rm(oz)
-    df[f"{p}_opp_pim_avg"]       = rm(opim)
-    df[f"{p}_team_pim_avg"]      = rm(tpim)   # team's own penalties (discipline)
-    df[f"{p}_ot_rate"]           = rm(ot)     # rate of games going to OT/SO
-    df[f"{p}_reg_win_pct"]       = rm(regw)   # wins in regulation only
-    # OT win rate: wins in OT / games that went to OT (NaN if no OT games yet → fill 0.5)
+    # ── FAMILY: WIN_RATE ───────────────────────────────────────────────────────
+    # Core win-rate signals in regulation, OT/SO, and exponentially weighted.
+    df[f"{p}_win_pct"]     = rm(wins)
+    df[f"{p}_reg_win_pct"] = rm(regw)           # regulation wins only
+    df[f"{p}_ewm_win_pct"] = wins.ewm(span=n, min_periods=1).mean()
+    df[f"{p}_win_pct_std"] = rs(wins)           # consistency of winning
+
+    # OT win rate: wins in OT / games that went to OT (NaN → 0.5 neutral)
     ot_sum  = ot.rolling(n, min_periods=1).sum()
     otw_sum = otw.rolling(n, min_periods=1).sum()
-    df[f"{p}_ot_win_rate"]       = (otw_sum / ot_sum.replace(0, np.nan)).fillna(0.5)
-    df[f"{p}_shg_rate"]          = rm(shg)    # short-handed goals scored
-    df[f"{p}_opp_shg_rate"]      = rm(oshg)   # opp short-handed goals (our PK weakness)
-    df[f"{p}_shooting_pct"]      = rm(shoot)  # goals / shots on goal
-    df[f"{p}_save_pct"]          = rm(save)   # 1 - opp_goals / opp_shots
+    df[f"{p}_ot_win_rate"] = (otw_sum / ot_sum.replace(0, np.nan)).fillna(0.5)
 
-    # Power play / penalty kill (summed over window to avoid 0-denominator)
+    # ── FAMILY: SCORING ────────────────────────────────────────────────────────
+    # Offensive output, defensive solidity, and game-result profiles.
+    df[f"{p}_goals_for_avg"]     = rm(gf)
+    df[f"{p}_goals_against_avg"] = rm(ga)
+    df[f"{p}_goal_diff"]         = df[f"{p}_goals_for_avg"] - df[f"{p}_goals_against_avg"]
+    df[f"{p}_gf_ga_ratio"]       = df[f"{p}_goals_for_avg"] / (df[f"{p}_goals_against_avg"] + 0.01)
+
+    # Game-profile rates (shift already applied to gf/ga)
+    shutout    = ga.eq(0).astype(float)           # held opponent scoreless
+    high_score = gf.ge(3).astype(float)           # scored 3+
+    blowout_w  = (gf - ga).ge(3).astype(float)    # won by 3+
+    close_game = (gf - ga).abs().le(1).astype(float)  # 1-goal margin
+    df[f"{p}_shutout_rate"]      = rm(shutout)    # P(keep opponent to 0)
+    df[f"{p}_high_scoring_rate"] = rm(high_score) # P(score 3+)
+    df[f"{p}_blowout_win_rate"]  = rm(blowout_w)  # P(dominant win)
+    df[f"{p}_close_game_rate"]   = rm(close_game) # P(1-goal game)
+
+    # EWM goal differential (how recent margin trend compares to rolling average)
+    goal_diff_raw = gf - ga
+    df[f"{p}_goal_diff_ewm"]     = goal_diff_raw.ewm(span=n, min_periods=1).mean()
+
+    # Std devs
+    df[f"{p}_goals_for_std"]     = rs(gf)
+    df[f"{p}_goals_against_std"] = rs(ga)
+    df[f"{p}_goal_diff_std"]     = rs(goal_diff_raw)
+
+    # ── FAMILY: SHOOTING ───────────────────────────────────────────────────────
+    # Shot volume, shooting efficiency, goaltending, and quality gap.
+    df[f"{p}_sog_avg"]            = rm(sog)
+    df[f"{p}_opp_sog_avg"]        = rm(osog)
+    df[f"{p}_shot_diff"]          = df[f"{p}_sog_avg"] - df[f"{p}_opp_sog_avg"]
+    df[f"{p}_shooting_pct"]       = rm(shoot)
+    df[f"{p}_save_pct"]           = rm(save)
+    # shooting_save_sum removed — ≈ PDO/100 which is already a feature (correlation)
+
+    # Shot quality gap: how much better we are at scoring vs how much we allow
+    # Positive = attack efficiency > defensive vulnerability → favourable
+    df[f"{p}_shot_quality_gap"]   = df[f"{p}_shooting_pct"] - (1 - df[f"{p}_save_pct"])
+
+    # Std devs
+    df[f"{p}_sog_std"]            = rs(sog)
+    df[f"{p}_opp_sog_std"]        = rs(osog)
+    df[f"{p}_shooting_pct_std"]   = rs(shoot)
+    df[f"{p}_save_pct_std"]       = rs(save)
+
+    # ── FAMILY: ADVANCED ───────────────────────────────────────────────────────
+    # Possession proxies: Corsi (all shot attempts), Fenwick (unblocked), PDO, zone starts.
+    df[f"{p}_corsi_pct"]          = rm(cf)
+    df[f"{p}_fenwick_pct"]        = rm(ff)
+    df[f"{p}_pdo"]                = rm(pdo)
+    df[f"{p}_off_zone_avg"]       = rm(oz)
+
+    # Std devs
+    df[f"{p}_corsi_pct_std"]      = rs(cf)
+    df[f"{p}_fenwick_pct_std"]    = rs(ff)
+    df[f"{p}_pdo_std"]            = rs(pdo)
+    df[f"{p}_off_zone_std"]       = rs(oz)
+
+    # ── FAMILY: SPECIAL_TEAMS ──────────────────────────────────────────────────
+    # Power play / penalty kill efficiency, short-handed goals, net PP goal impact.
     ppg  = df["team_ppg"].shift(1).rolling(n, min_periods=1).sum()
     ppo  = df["team_ppo"].shift(1).rolling(n, min_periods=1).sum()
     oppg = df["opp_ppg"].shift(1).rolling(n, min_periods=1).sum()
     oppo = df["opp_ppo"].shift(1).rolling(n, min_periods=1).sum()
-    df[f"{p}_pp_efficiency"]  = ppg  / ppo.replace(0, np.nan)
-    df[f"{p}_pk_efficiency"]  = 1 - (oppg / oppo.replace(0, np.nan))
+    df[f"{p}_pp_efficiency"]      = ppg  / ppo.replace(0, np.nan)
+    df[f"{p}_pk_efficiency"]      = 1 - (oppg / oppo.replace(0, np.nan))
+    # net_special_teams removed — derivable from pp_efficiency and pk_efficiency (redundant)
+    df[f"{p}_shg_rate"]           = rm(shg)    # short-handed goals scored
+    df[f"{p}_opp_shg_rate"]       = rm(oshg)   # opp short-handed goals (PK weakness)
 
-    # ── Derived rolling means ──────────────────────────────────────────────────
-    df[f"{p}_goal_diff"]        = df[f"{p}_goals_for_avg"]  - df[f"{p}_goals_against_avg"]
-    df[f"{p}_shot_diff"]        = df[f"{p}_sog_avg"]        - df[f"{p}_opp_sog_avg"]
-    df[f"{p}_gf_ga_ratio"]      = df[f"{p}_goals_for_avg"]  / (df[f"{p}_goals_against_avg"] + 0.01)
-    df[f"{p}_shooting_save_sum"]= df[f"{p}_shooting_pct"]   + df[f"{p}_save_pct"]  # PDO proxy
-    df[f"{p}_net_special_teams"]= df[f"{p}_pp_efficiency"].fillna(0) - (1 - df[f"{p}_pk_efficiency"].fillna(1))
-    df[f"{p}_pim_diff"]         = df[f"{p}_opp_pim_avg"]    - df[f"{p}_team_pim_avg"]  # net discipline
+    # Net power-play goals per game (positive = PP scores more than we give up)
+    net_ppg_raw = df["team_ppg"].shift(1) - df["opp_ppg"].shift(1)
+    df[f"{p}_net_ppg_per_game"]   = rm(net_ppg_raw)
 
-    # ── Exponentially weighted win rate (weights recent games more) ───────────
-    df[f"{p}_ewm_win_pct"] = wins.ewm(span=n, min_periods=1).mean()
+    # ── FAMILY: DISCIPLINE ─────────────────────────────────────────────────────
+    # Penalty minutes: our discipline vs opponent's.
+    # pim_diff removed — derivable from the two component features (redundant).
+    df[f"{p}_team_pim_avg"]       = rm(tpim)
+    df[f"{p}_opp_pim_avg"]        = rm(opim)
 
-    # ── Standard deviations (consistency / volatility) ────────────────────────
-    df[f"{p}_win_pct_std"]       = rs(wins)
-    df[f"{p}_goals_for_std"]     = rs(gf)
-    df[f"{p}_goals_against_std"] = rs(ga)
-    df[f"{p}_sog_std"]           = rs(sog)
-    df[f"{p}_opp_sog_std"]       = rs(osog)
-    df[f"{p}_fenwick_pct_std"]   = rs(ff)
-    df[f"{p}_pdo_std"]           = rs(pdo)
-    df[f"{p}_off_zone_std"]      = rs(oz)
-    df[f"{p}_shooting_pct_std"]  = rs(shoot)
-    df[f"{p}_save_pct_std"]      = rs(save)
-    df[f"{p}_goal_diff_std"]     = rs(gf - ga)  # consistency of goal differential
+    # ── FAMILY: FACEOFFS ───────────────────────────────────────────────────────
+    # Faceoff win% correlates with zone starts and puck possession.
+    df[f"{p}_faceoff_pct"]        = rm(fo)
+
+    # ── FAMILY: OVERTIME ───────────────────────────────────────────────────────
+    # How often games go to OT/SO; performance once they do.
+    df[f"{p}_ot_rate"]            = rm(ot)     # P(game reaches OT/SO)
 
     return df
 
@@ -107,7 +166,7 @@ def compute_team_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add non-rolling derived features."""
+    """Add non-rolling derived features (schedule context, season-level rates)."""
     df = df.sort_values(["team", "season", "date"]).copy()
 
     df["days_since_last_game"] = (
@@ -116,6 +175,21 @@ def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     df["game_number_in_season"] = df["game_num"]
     df["pp_opportunity_rate"]   = df["team_ppo"] / (df["team_ppo"] + df["opp_ppo"] + 1e-9)
     df["back_to_back"]          = (df["days_since_last_game"] <= 1).astype(int)
+
+    # Rolling 10-day workload: games played in the 10 calendar days before each game
+    def _count_last_10(dates: pd.Series) -> pd.Series:
+        arr = dates.values.astype("datetime64[D]")
+        result = np.zeros(len(arr), dtype=int)
+        for i in range(len(arr)):
+            cutoff = arr[i] - np.timedelta64(10, "D")
+            result[i] = int(np.sum((arr[:i] >= cutoff) & (arr[:i] < arr[i])))
+        return pd.Series(result, index=dates.index)
+
+    df["games_in_last_10"] = (
+        df.groupby(["team", "season"])["date"]
+        .transform(_count_last_10)
+        .fillna(0)
+    )
 
     # Cumulative season win rate (expanding, shift(1) via transform)
     df["season_win_pct"] = (
@@ -213,18 +287,24 @@ def add_h2h_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_differential_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Home team minus opponent for key rolling metrics.
-    Captures the relative matchup quality directly as a single feature.
+    Captures relative matchup quality directly as a single number.
     """
     diffs = {
-        "win_pct":        "win_pct_diff",
-        "goals_for_avg":  "gf_diff",
-        "fenwick_pct":    "fenwick_diff",
-        "pdo":            "pdo_diff",
-        "shooting_pct":   "shooting_diff",
-        "save_pct":       "save_diff",
-        "pp_efficiency":  "pp_eff_diff",
-        "pk_efficiency":  "pk_eff_diff",
-        "off_zone_avg":   "oz_diff",
+        "win_pct":           "win_pct_diff",
+        "goals_for_avg":     "gf_diff",
+        "fenwick_pct":       "fenwick_diff",
+        "pdo":               "pdo_diff",
+        "shooting_pct":      "shooting_diff",
+        "save_pct":          "save_diff",
+        "pp_efficiency":     "pp_eff_diff",
+        "pk_efficiency":     "pk_eff_diff",
+        "off_zone_avg":      "oz_diff",
+        "shutout_rate":      "shutout_rate_diff",
+        "high_scoring_rate": "high_scoring_rate_diff",
+        "goal_diff_ewm":     "goal_diff_ewm_diff",
+        "shot_quality_gap":  "shot_quality_gap_diff",
+        "net_ppg_per_game":  "net_ppg_diff",
+        # net_special_teams, pim_diff, shooting_save_sum removed (redundant)
     }
     for w in WINDOWS:
         for stat, name in diffs.items():

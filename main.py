@@ -62,10 +62,12 @@ def _goals_ensemble_pred(models_by_window: dict, game_row: pd.Series,
     return float(np.mean(preds)) if preds else 5.5
 
 
-def _ensemble_probs(calibrated: dict, game_row: pd.Series, df_ref: pd.DataFrame) -> dict:
+def _ensemble_probs(calibrated: dict, game_row: pd.Series, df_ref: pd.DataFrame,
+                    weights: dict | None = None) -> dict:
     """
     Run every (window, model) combination on one game row.
-    Returns {label: probability} and the ensemble mean.
+    Returns {label: probability}.  Weighted mean is computed at the call site.
+    weights: optional {label: weight} from live accuracy softmax (Fix F).
     """
     all_probs: dict[str, float] = {}
     for w, models in calibrated.items():
@@ -115,35 +117,63 @@ def main():
         print(f"── Window N={w} | {len(feat_cols)} features ──────────────────────────")
         all_models[w] = train.train_all(df_train_fe[feat_cols], y_train)
 
-    # ── 5. Calibrate per window ───────────────────────────────────────────────
+    # ── 5. Calibrate per window (Fix A: separate calibration-fit vs eval sets) ──
+    # Split last 20% of training into:
+    #   80–95% → fit the calibrator       (cal_fit)
+    #   95–100% → choose best method + threshold optimisation  (cal_eval)
+    # This prevents the calibrator from being selected based on data it memorised.
     print("\nCalibrating models...")
-    cal_split = int(len(df_train_fe) * 0.8)
+    n_train    = len(df_train_fe)
+    cal_start  = int(n_train * 0.80)
+    eval_start = int(n_train * 0.95)
     calibrated: dict = {}
 
     for w, models in all_models.items():
-        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
-        X_cal = df_train_fe[feat_cols].iloc[cal_split:]
-        y_cal = y_train.iloc[cal_split:]
-        print(f"  N={w}:")
-        calibrated[w] = {name: calibration.calibrate(m, X_cal, y_cal) for name, m in models.items()}
+        feat_cols  = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
+        X_cal_fit  = df_train_fe[feat_cols].iloc[cal_start:eval_start]
+        y_cal_fit  = y_train.iloc[cal_start:eval_start]
+        X_cal_eval = df_train_fe[feat_cols].iloc[eval_start:]
+        y_cal_eval = y_train.iloc[eval_start:]
+        print(f"  N={w}  (fit on {len(X_cal_fit)} games, eval on {len(X_cal_eval)} games):")
+        calibrated[w] = {
+            name: calibration.calibrate(m, X_cal_fit, y_cal_fit, X_cal_eval, y_cal_eval)
+            for name, m in models.items()
+        }
 
-    # ── 6. Threshold optimisation ─────────────────────────────────────────────
-    print("\nOptimising decision thresholds (F-0.5)...")
+    # ── 6. Threshold optimisation (Fix B: use held-out eval set, not fit set) ──
+    print("\nOptimising decision thresholds (F-0.5, using held-out eval set)...")
     for w, models in calibrated.items():
-        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
-        X_cal = df_train_fe[feat_cols].iloc[cal_split:]
-        y_cal = y_train.iloc[cal_split:]
+        feat_cols  = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
+        X_cal_eval = df_train_fe[feat_cols].iloc[eval_start:]
+        y_cal_eval = y_train.iloc[eval_start:]
         for name, model in list(models.items()):
-            t = evaluate.find_optimal_threshold(model, X_cal, y_cal, beta=0.5)
+            t = evaluate.find_optimal_threshold(model, X_cal_eval, y_cal_eval, beta=0.5)
             calibrated[w][name] = evaluate.ThresholdedModel(model, t)
             print(f"  N={w} {name}: threshold={t:.3f}")
 
-    # ── 7. Live validation on played 2025-26 games ───────────────────────────
+    # ── 7. Live validation + build ensemble weights (Fix F) ──────────────────
     df_live = df_predict_fe[df_predict_fe["result"].notna()].copy()
+    model_weights: dict | None = None
+
     if not df_live.empty:
         print(f"\nLive validation on {len(df_live)} played 2025-26 games...")
         results = evaluate.sliding_window_evaluation(calibrated, df_live)
         evaluate.print_results(results)
+
+        # Weight each (window, model) by its live accuracy using softmax.
+        # Temperature=8 keeps weights meaningful without over-concentrating on one model.
+        if not results.empty:
+            acc_map = {
+                f"{row['model']}  N={int(row['window'])}": row["accuracy"]
+                for _, row in results.iterrows()
+            }
+            accs   = np.array(list(acc_map.values()))
+            exp_a  = np.exp(accs * 8.0)
+            weights = exp_a / exp_a.sum()
+            model_weights = dict(zip(acc_map.keys(), weights))
+            print("\n  Ensemble weights (by live accuracy):")
+            for k, w in sorted(model_weights.items(), key=lambda x: -x[1]):
+                print(f"    {k:<40} {w:.3f}  (acc={acc_map[k]:.3f})")
     else:
         results = pd.DataFrame()
         print("\nNo played 2025-26 games found for live validation.")
@@ -253,13 +283,19 @@ def main():
     bet_summary = []
 
     for _, game in next_games.iterrows():
-        # Ensemble probabilities across ALL windows and models
-        all_probs = _ensemble_probs(calibrated, game, df_all_fe)
+        # Ensemble probabilities across ALL windows and models (Fix F: weighted)
+        all_probs = _ensemble_probs(calibrated, game, df_all_fe, weights=model_weights)
         if not all_probs:
             print(f"\n  {game['team']} vs {game['opponent']}: features unavailable, skipping.")
             continue
 
-        ensemble_p   = float(np.mean(list(all_probs.values())))
+        if model_weights:
+            probs_arr   = np.array([all_probs[k] for k in all_probs])
+            wts_arr     = np.array([model_weights.get(k, 1.0) for k in all_probs])
+            wts_arr    /= wts_arr.sum()
+            ensemble_p  = float(np.dot(probs_arr, wts_arr))
+        else:
+            ensemble_p  = float(np.mean(list(all_probs.values())))
         n_win        = sum(1 for p in all_probs.values() if p >= 0.5)
         consensus    = f"{n_win}/{len(all_probs)} models predict WIN"
         prediction   = "WIN" if ensemble_p >= 0.5 else "LOSS"
@@ -362,11 +398,24 @@ def main():
         away_odds = _parse_odds(
             f"  [Moneyline] {game['opponent']} (away) decimal odds  (Enter to skip): ")
 
-        # ── Spread (puck line -1.5) odds — each side independent ─────────────
-        home_spread_odds = _parse_odds(
-            f"  [Spread]    {game['team']} -1.5 decimal odds        (Enter to skip): ")
-        away_spread_odds = _parse_odds(
-            f"  [Spread]    {game['opponent']} -1.5 decimal odds     (Enter to skip): ")
+        # ── Spread (puck line) — favourite gets -1.5, underdog gets +1.5 ────────
+        # Book favourite = lower decimal odds; fall back to model probability.
+        if home_odds is not None and away_odds is not None:
+            home_is_fav = home_odds <= away_odds
+        elif home_odds is not None:
+            home_is_fav = home_odds < 2.0
+        else:
+            home_is_fav = ensemble_p >= 0.5
+
+        fav_team  = game["team"]      if home_is_fav else game["opponent"]
+        dog_team  = game["opponent"]  if home_is_fav else game["team"]
+        p_fav_m15 = p_home_spread     if home_is_fav else p_away_spread
+        p_dog_p15 = 1.0 - p_fav_m15  # +1.5 is complement of opponent's -1.5
+
+        fav_spread_odds = _parse_odds(
+            f"  [Spread]    {fav_team} -1.5 decimal odds           (Enter to skip): ")
+        dog_spread_odds = _parse_odds(
+            f"  [Spread]    {dog_team} +1.5 decimal odds           (Enter to skip): ")
 
         # ── Total goals line + over/under odds ────────────────────────────────
         goals_line      = _parse_line(
@@ -377,32 +426,54 @@ def main():
             goals_under_odds = _parse_odds(f"    UNDER {goals_line} decimal odds: ")
 
         all_odds_skipped = all(x is None for x in [
-            home_odds, away_odds, home_spread_odds, away_spread_odds,
+            home_odds, away_odds, fav_spread_odds, dog_spread_odds,
             goals_over_odds, goals_under_odds,
         ])
         if all_odds_skipped:
             print("  [skipped]")
             continue
 
-        def _print_bet(label: str, p: float, odds: float):
-            """Print EV/Kelly for one bet side and append to bet_summary if +EV."""
+        # Fix C: de-juice implied prob when both ML odds are available
+        dj_home_imp = (betting.dejuiced_implied_prob(home_odds, away_odds)
+                       if home_odds and away_odds else None)
+        dj_away_imp = (betting.dejuiced_implied_prob(away_odds, home_odds)
+                       if home_odds and away_odds else None)
+
+        MIN_EDGE = 0.05  # Fix D: minimum edge threshold
+
+        def _print_bet(label: str, p: float, odds: float, other_odds: float | None = None):
+            """
+            Print EV/Kelly for one bet side.
+            Fix C: uses de-juiced edge when other_odds is available.
+            Fix D: only recommends bets where edge > MIN_EDGE AND confidence is not LOW.
+            """
             imp        = betting.implied_prob(odds)
             ev         = betting.expected_value(p, odds)
             kf         = betting.kelly_fraction(p, odds)
-            edg        = betting.edge(p, odds)
             stake_full = kf * args.bankroll
             stake_half = kf * 0.5 * args.bankroll
-            bet_flag   = "✓ BET" if ev > 0 else "✗ SKIP"
             dist       = abs(p - 0.5)
             conf       = "▲ HIGH" if dist > 0.08 else ("▶ MED" if dist > 0.04 else "▼ LOW")
+
+            # De-juiced edge (Fix C)
+            if other_odds is not None:
+                edg      = betting.edge_dejuiced(p, odds, other_odds)
+                edge_lbl = f"{edg:+.1%} (de-juiced)"
+            else:
+                edg      = betting.edge(p, odds)
+                edge_lbl = f"{edg:+.1%}"
+
+            # Fix D: require minimum edge + non-LOW confidence to recommend
+            is_value = (ev > 0) and (edg >= MIN_EDGE) and (conf != "▼ LOW")
+            bet_flag = "✓ BET" if is_value else "✗ SKIP"
 
             print(f"  ── {label} ──────────────────────────────────────")
             print(f"  Model est. prob      : {p:.1%}   {conf}")
             print(f"  Decimal odds         : {odds:.2f}")
             print(f"  Book implied prob    : {imp:.1%}")
-            print(f"  Your edge            : {edg:+.1%}")
+            print(f"  Your edge            : {edge_lbl}")
             print(f"  Expected value       : {ev:+.1%}   {bet_flag}")
-            if ev > 0:
+            if is_value:
                 print(f"  Full Kelly stake     : {kf:.1%}   (${stake_full:,.2f})")
                 print(f"  Half Kelly stake     : {kf*0.5:.1%}   (${stake_half:,.2f})"
                       f"  ← recommended")
@@ -420,28 +491,34 @@ def main():
 
         print()
 
-        # Moneyline
+        # Moneyline — pass other_odds for de-juiced edge (Fix C)
         p_home = ensemble_p
         p_away = 1.0 - ensemble_p
         if home_odds is not None:
-            _print_bet(f"{game['team']} ML (home)", p_home, home_odds)
+            _print_bet(f"{game['team']} ML (home)", p_home, home_odds,
+                       other_odds=away_odds)
         if away_odds is not None:
-            _print_bet(f"{game['opponent']} ML (away)", p_away, away_odds)
+            _print_bet(f"{game['opponent']} ML (away)", p_away, away_odds,
+                       other_odds=home_odds)
 
-        # Spread — each side uses its own independent model
-        if home_spread_odds is not None:
-            _print_bet(f"{game['team']} -1.5 (spread)", p_home_spread, home_spread_odds)
-        if away_spread_odds is not None:
-            _print_bet(f"{game['opponent']} -1.5 (spread)", p_away_spread, away_spread_odds)
+        # Spread — de-juice using the opposite spread odds when both available
+        if fav_spread_odds is not None:
+            _print_bet(f"{fav_team} -1.5 (spread)", p_fav_m15, fav_spread_odds,
+                       other_odds=dog_spread_odds)
+        if dog_spread_odds is not None:
+            _print_bet(f"{dog_team} +1.5 (spread)", p_dog_p15, dog_spread_odds,
+                       other_odds=fav_spread_odds)
 
-        # Total goals
+        # Total goals — de-juice using over/under as paired odds
         if goals_line is not None:
             p_over_goals  = totals.prob_over_goals(pred_total_goals, goals_line)
             p_under_goals = totals.prob_under(p_over_goals)
             if goals_over_odds is not None:
-                _print_bet(f"Goals OVER  {goals_line}", p_over_goals, goals_over_odds)
+                _print_bet(f"Goals OVER  {goals_line}", p_over_goals, goals_over_odds,
+                           other_odds=goals_under_odds)
             if goals_under_odds is not None:
-                _print_bet(f"Goals UNDER {goals_line}", p_under_goals, goals_under_odds)
+                _print_bet(f"Goals UNDER {goals_line}", p_under_goals, goals_under_odds,
+                           other_odds=goals_over_odds)
 
     # ── Betting summary ───────────────────────────────────────────────────────
     if bet_summary:
@@ -455,27 +532,14 @@ def main():
               f"({total_half/args.bankroll:.1%} of bankroll)")
         print(f"  Total full-Kelly   : ${total_full:,.2f}  "
               f"({total_full/args.bankroll:.1%} of bankroll)")
-        # Group by game, preserving the order games appeared in the loop
-        seen_games: list = []
-        games_bets: dict = {}
-        for s in bet_summary:
-            gk = s["game_key"]
-            if gk not in games_bets:
-                seen_games.append(gk)
-                games_bets[gk] = []
-            games_bets[gk].append(s)
-
-        col_hdr = f"  {'Bet':<30} {'Conf':<8} {'Est.P':>7} {'Odds':>6} {'EV%':>7} {'½Kelly%':>8} {'Stake':>10}"
-        for gk in seen_games:
-            bets = sorted(games_bets[gk], key=lambda x: x["ev"], reverse=True)
-            print(f"\n  ┌─ {gk} {'─'*(max(0, 74 - len(gk)))}┐")
-            print(col_hdr)
-            print(f"  {'─'*82}")
-            for s in bets:
-                print(f"  {s['matchup']:<30} {s['conf']:<8} {s['prob']:>7.1%} {s['odds']:>6.2f}"
-                      f" {s['ev']:>+7.1%} {s['half_kelly']/args.bankroll:>8.1%}"
-                      f" ${s['half_kelly']:>9.2f}")
-            print(f"  └{'─'*82}┘")
+        ranked = sorted(bet_summary, key=lambda x: x["ev"], reverse=True)
+        print(f"\n  {'#':<3} {'Game':<24} {'Bet':<24} {'Conf':<8}"
+              f" {'Est.P':>7} {'Odds':>6} {'EV%':>7} {'½Kelly%':>8} {'Stake':>10}")
+        print(f"  {'─'*98}")
+        for rank, s in enumerate(ranked, 1):
+            print(f"  {rank:<3} {s['game_key']:<24} {s['matchup']:<24} {s['conf']:<8}"
+                  f" {s['prob']:>7.1%} {s['odds']:>6.2f} {s['ev']:>+7.1%}"
+                  f" {s['half_kelly']/args.bankroll:>8.1%} ${s['half_kelly']:>9.2f}")
     elif args.predict:
         print(f"\n  No positive-EV bets found for {target_date.date()}.")
 

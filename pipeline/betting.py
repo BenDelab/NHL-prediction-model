@@ -7,7 +7,12 @@ giving a profit of $0.85 on a win).
 Key concepts
 ────────────
 • Implied probability  = 1 / decimal_odds
-    The probability baked into the odds by the bookmaker (includes their margin).
+    The raw probability baked into the odds — includes the bookmaker's margin.
+
+• De-juiced implied    = p_this / (p_this + p_other)
+    Strips the vig so the two sides sum to 100%.  Use this for edge calculation
+    when both sides' odds are available — raw implied overstates your edge.
+    Example: 1.85 / 1.95 → raw 54.1% + 51.3% = 105.4%; de-juiced 51.3% / 48.7%.
 
 • Expected value (EV) = p × (odds − 1) − (1 − p)
     The average profit per $1 staked given your true win probability p.
@@ -23,10 +28,20 @@ from __future__ import annotations
 
 
 def implied_prob(decimal_odds: float) -> float:
-    """Book's implied win probability (overround not removed)."""
+    """Book's raw implied win probability (overround not removed)."""
     if decimal_odds <= 1.0:
         raise ValueError(f"Decimal odds must be > 1.0, got {decimal_odds}")
     return 1.0 / decimal_odds
+
+
+def dejuiced_implied_prob(this_odds: float, other_odds: float) -> float:
+    """
+    Strip the bookmaker's margin and return the true implied probability
+    for this side.  Requires both sides' odds.
+    """
+    p_this  = 1.0 / this_odds
+    p_other = 1.0 / other_odds
+    return p_this / (p_this + p_other)
 
 
 def expected_value(p: float, decimal_odds: float) -> float:
@@ -59,8 +74,16 @@ def kelly_stake(p: float, decimal_odds: float, bankroll: float,
 
 
 def edge(model_p: float, decimal_odds: float) -> float:
-    """Your model's probability minus the book's implied probability."""
+    """Raw edge: model probability minus vigged implied probability."""
     return model_p - implied_prob(decimal_odds)
+
+
+def edge_dejuiced(model_p: float, this_odds: float, other_odds: float) -> float:
+    """
+    True edge against de-juiced book probability.
+    Use when both sides' odds are available — more accurate than raw edge.
+    """
+    return model_p - dejuiced_implied_prob(this_odds, other_odds)
 
 
 def format_bet(

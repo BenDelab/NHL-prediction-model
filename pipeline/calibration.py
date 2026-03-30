@@ -1,20 +1,11 @@
 """
 Probability calibration — Platt scaling (sigmoid) vs isotonic regression.
 
-Why calibrate?
-  A model predicting "65% win probability" should be right ~65% of the time.
-  Without calibration, tree models (RF, XGB, LGBM) often produce probabilities
-  that are too confident or too conservative. Calibration corrects this bias,
-  which matters when you want to compare confidence across predictions.
-
-  - Sigmoid (Platt scaling): fits a logistic regression on the model's raw scores.
-    More stable on smaller datasets.
-  - Isotonic regression: non-parametric staircase fit, more flexible but needs
-    more calibration data to avoid overfitting.
-
-  We try both and keep whichever gives the lower Brier score on the held-out
-  calibration set. If neither method improves on the raw model, the raw model
-  is returned unchanged.
+Fix A: calibration method selection now uses a separate held-out evaluation set
+(X_eval / y_eval) rather than the same data used to fit the calibrator.
+This prevents the calibrator from always appearing to improve on its own training
+data — isotonic regression in particular memorises small datasets perfectly,
+giving a falsely low Brier score and being selected when it shouldn't be.
 """
 
 import numpy as np
@@ -23,7 +14,7 @@ from sklearn.metrics import brier_score_loss
 
 
 def _try_calibrate(model, X_cal, y_cal, method: str):
-    """Attempt sklearn cv='prefit' calibration; fall back to manual Platt if removed."""
+    """Fit one calibration method on (X_cal, y_cal). Returns fitted calibrator."""
     try:
         cal = CalibratedClassifierCV(model, method=method, cv="prefit")
         cal.fit(X_cal, y_cal)
@@ -31,7 +22,7 @@ def _try_calibrate(model, X_cal, y_cal, method: str):
     except (ValueError, TypeError):
         pass
 
-    # sklearn >= 1.6 removed cv="prefit" — implement Platt scaling manually
+    # sklearn >= 1.6 removed cv="prefit" — manual fallback
     from sklearn.linear_model import LogisticRegression
     from sklearn.isotonic import IsotonicRegression
 
@@ -69,21 +60,27 @@ def _try_calibrate(model, X_cal, y_cal, method: str):
         return _IsotonicCal(model, iso)
 
 
-def calibrate(model, X_cal, y_cal):
+def calibrate(model, X_cal, y_cal, X_eval=None, y_eval=None):
     """
-    Try sigmoid and isotonic calibration; return whichever has the lower Brier
-    score on the calibration set. Falls back to the raw model if neither helps.
-    """
-    raw_brier = brier_score_loss(y_cal, model.predict_proba(X_cal)[:, 1])
+    Fit sigmoid and isotonic calibrators on (X_cal, y_cal).
+    Select the best method by Brier score on (X_eval, y_eval).
 
+    X_eval / y_eval should be a separate held-out set not used for fitting —
+    this prevents leakage where the calibrator always looks better on its own
+    training data. Falls back to X_cal if X_eval is not provided.
+    """
+    if X_eval is None or y_eval is None:
+        X_eval, y_eval = X_cal, y_cal
+
+    raw_brier  = brier_score_loss(y_eval, model.predict_proba(X_eval)[:, 1])
     best_model  = model
     best_brier  = raw_brier
     best_method = "none (raw)"
 
     for method in ("sigmoid", "isotonic"):
         try:
-            cal = _try_calibrate(model, X_cal, y_cal, method)
-            b = brier_score_loss(y_cal, cal.predict_proba(X_cal)[:, 1])
+            cal = _try_calibrate(model, X_cal, y_cal, method)   # fit on X_cal
+            b   = brier_score_loss(y_eval, cal.predict_proba(X_eval)[:, 1])  # eval on X_eval
             if b < best_brier:
                 best_brier  = b
                 best_model  = cal
