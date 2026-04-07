@@ -1,43 +1,30 @@
 """
 Secondary models for OT likelihood and regulation win prediction.
 
-These are lightweight Logistic Regression pipelines — no hyperparameter
-tuning needed since they serve as supplementary analysis, not the primary bet signal.
+Upgraded from single-LR to the same LR+XGBoost+LightGBM ensemble used by
+the totals/spread models.  Returns {name: model} dicts so main.py can
+average probabilities across the ensemble — consistent with how every other
+market is modelled.
 """
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
+from models.totals import train_spread_ensemble
 
 
-def train_ot_model(X: pd.DataFrame, y_ot: pd.Series):
+def train_ot_model(X, y_ot) -> dict:
     """
-    Train a model to predict P(game goes to OT/SO).
+    Train an ensemble to predict P(game goes to OT/SO).
     y_ot: binary series where 1 = game went to overtime/shootout.
+    Returns {name: fitted_pipeline}.
     """
-    pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler",  StandardScaler()),
-        ("model",   LogisticRegression(max_iter=1000, C=0.1, solver="lbfgs")),
-    ])
-    pipe.fit(X, y_ot)
-    return pipe
+    return train_spread_ensemble(X, y_ot)
 
 
-def train_reg_win_model(X: pd.DataFrame, y_reg_win: pd.Series):
+def train_reg_win_model(X, y_reg_win) -> dict:
     """
-    Train a model to predict P(home team wins in regulation).
+    Train an ensemble to predict P(home team wins in regulation).
     y_reg_win: binary series where 1 = home team won in regulation.
+    Returns {name: fitted_pipeline}.
     """
-    pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler",  StandardScaler()),
-        ("model",   LogisticRegression(max_iter=1000, C=0.1, solver="lbfgs")),
-    ])
-    pipe.fit(X, y_reg_win)
-    return pipe
+    return train_spread_ensemble(X, y_reg_win)

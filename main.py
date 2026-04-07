@@ -20,6 +20,106 @@ from pipeline import data_loader, features, noise_reduction, calibration, bettin
 from models import train, evaluate, secondary, totals
 
 
+def compute_sample_weights(df: pd.DataFrame) -> np.ndarray:
+    """
+    Combine recency (season) weights with early-season game-number ramp.
+
+    Season weights: older seasons count less so recent form drives training.
+    Early-season ramp: first ~15 games of a season are volatile/incomplete —
+    ramp from 0 → 1 over games 1-15 so they don't anchor the model.
+    """
+    season_w = {"2021-22": 1.0, "2022-23": 1.2, "2023-24": 1.5, "2024-25": 2.0}
+    sw = df["season"].map(season_w).fillna(1.0).values
+    game_nums = df["game_num"].fillna(15).clip(lower=0).values
+    early = np.minimum(game_nums / 15.0, 1.0)
+    return (sw * early).astype(float)
+
+
+def _log_feature_importances(all_models: dict, df_train_fe: pd.DataFrame,
+                              n_top: int = 15) -> None:
+    """Print top and bottom N features averaged across XGB and LGBM over all windows."""
+    importance_sum: dict = {}
+    count = 0
+    for w, models in all_models.items():
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe)
+                     if c in df_train_fe.columns]
+        for name, model in models.items():
+            if name not in ("XGBoost", "LightGBM"):
+                continue
+            pipe = getattr(model, "_model", model)  # unwrap ThresholdedModel if needed
+            estimator = getattr(pipe, "named_steps", {}).get("model", None)
+            if estimator is None or not hasattr(estimator, "feature_importances_"):
+                continue
+            imps = estimator.feature_importances_
+            for feat, imp in zip(feat_cols, imps[:len(feat_cols)]):
+                importance_sum[feat] = importance_sum.get(feat, 0.0) + float(imp)
+            count += 1
+
+    if count == 0 or not importance_sum:
+        return
+
+    avg = {k: v / count for k, v in importance_sum.items()}
+    ranked = sorted(avg.items(), key=lambda x: -x[1])
+    print(f"\n  Feature importances (avg across {count} XGB+LGBM models):")
+    print(f"  Top {n_top}:")
+    for feat, imp in ranked[:n_top]:
+        print(f"    {feat:<52} {imp:.4f}")
+    print(f"  Bottom {n_top}:")
+    for feat, imp in ranked[-n_top:]:
+        print(f"    {feat:<52} {imp:.4f}")
+
+
+def _walk_forward_validation(df_train_fe: pd.DataFrame,
+                              y_train: pd.Series) -> None:
+    """
+    Train on 2021-22 → 2023-24, test on 2024-25 using a fast LR pipeline.
+    Gives a realistic out-of-time accuracy estimate independent of live-season data.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import accuracy_score, roc_auc_score
+
+    train_seasons = {"2021-22", "2022-23", "2023-24"}
+    train_mask = df_train_fe["season"].isin(train_seasons)
+    test_mask  = df_train_fe["season"] == "2024-25"
+
+    if train_mask.sum() < 100 or test_mask.sum() < 20:
+        print("  [walk-forward] insufficient data, skipping.")
+        return
+
+    print("\nWalk-forward validation  (train 2021-24 → test 2024-25, LR-only):")
+    for w in evaluate.WINDOWS:
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe)
+                     if c in df_train_fe.columns]
+        X_wf_tr = df_train_fe.loc[train_mask, feat_cols]
+        y_wf_tr = y_train[train_mask]
+        X_wf_te = df_train_fe.loc[test_mask, feat_cols]
+        y_wf_te = y_train[test_mask]
+
+        pipe = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler",  StandardScaler()),
+            ("model",   LogisticRegression(C=0.1, max_iter=1000, random_state=42)),
+        ])
+        pipe.fit(X_wf_tr, y_wf_tr)
+        acc = accuracy_score(y_wf_te, pipe.predict(X_wf_te))
+        auc = roc_auc_score(y_wf_te, pipe.predict_proba(X_wf_te)[:, 1])
+        print(f"  N={w:2d}  acc={acc:.3f}  AUC={auc:.3f}  ({len(y_wf_te)} test games)")
+
+
+def _secondary_prob(models: dict, X: pd.DataFrame) -> float:
+    """Average predict_proba across a secondary ensemble dict."""
+    probs = []
+    for m in models.values():
+        try:
+            probs.append(float(m.predict_proba(X)[0][1]))
+        except Exception:
+            pass
+    return float(np.mean(probs)) if probs else 0.5
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="NHL Home Game Predictor")
     p.add_argument("--predict",   action="store_true", help="Run prediction mode for upcoming games")
@@ -82,6 +182,79 @@ def _ensemble_probs(calibrated: dict, game_row: pd.Series, df_ref: pd.DataFrame,
     return all_probs
 
 
+def _explain_bet(s: dict) -> str:
+    """
+    Generate a 1-2 sentence plain-English rationale for a top-pick bet.
+    Uses context stored in the bet_summary entry.
+    """
+    bet_type = s.get("bet_type", "ml")
+    prob     = s["prob"]
+    edg      = s["edg"]
+    ev       = s["ev"]
+
+    if bet_type == "ml":
+        n_con   = s.get("n_consensus", 0)
+        n_tot   = s.get("total_models", 16)
+        wavgs   = s.get("window_avgs", {})
+        side    = s.get("side", "home")
+        team    = s.get("home_team" if side == "home" else "away_team", "the team")
+
+        # Consensus sentence
+        pct_agree = n_con / n_tot if n_tot else 0
+        if pct_agree >= 0.80:
+            consensus_str = f"{n_con}/{n_tot} models back {team}"
+        elif pct_agree >= 0.65:
+            consensus_str = f"A solid {n_con}/{n_tot} models favour {team}"
+        else:
+            consensus_str = f"{n_con}/{n_tot} models lean toward {team}"
+
+        # Window consistency sentence
+        if wavgs:
+            vals = list(wavgs.values())
+            spread_w = max(vals) - min(vals)
+            short_key = min(wavgs, key=lambda k: int(k.split("=")[1].split(" ")[0]))
+            long_key  = max(wavgs, key=lambda k: int(k.split("=")[1].split(" ")[0]))
+            short_p, long_p = wavgs[short_key], wavgs[long_key]
+            if spread_w < 0.05:
+                form_str = "All rolling windows are tightly aligned — both recent and long-term form agree."
+            elif short_p > long_p + 0.04:
+                form_str = (f"Recent form ({short_key}: {short_p:.0%}) outpaces the long-term baseline "
+                            f"({long_key}: {long_p:.0%}), suggesting positive momentum.")
+            elif long_p > short_p + 0.04:
+                form_str = (f"Long-term indicators ({long_key}: {long_p:.0%}) are stronger than recent "
+                            f"form ({short_key}: {short_p:.0%}) — sustained quality over the season.")
+            else:
+                form_str = "Short and long-term windows are broadly consistent across the board."
+        else:
+            form_str = f"Edge of {edg:+.1%} after de-juicing the book's margin."
+
+        return f"{consensus_str} at {prob:.0%}. {form_str}"
+
+    elif bet_type in ("spread_fav", "spread_dog"):
+        fav  = s.get("fav_team", "the favourite")
+        dog  = s.get("dog_team", "the underdog")
+        line = "-1.5" if bet_type == "spread_fav" else "+1.5"
+        team = fav if bet_type == "spread_fav" else dog
+        opp  = dog if bet_type == "spread_fav" else fav
+        return (f"Model prices {team} {line} at {prob:.0%} — a {edg:+.1%} true edge "
+                f"after removing the vig. Goal differential and recent dominant-win "
+                f"rate both support a multi-goal margin over {opp}.")
+
+    elif bet_type in ("goals_over", "goals_under"):
+        pred  = s.get("pred_goals", 0.0)
+        line  = s.get("goals_line", 0.0)
+        diff  = abs(pred - line)
+        direction = "over" if bet_type == "goals_over" else "under"
+        side_word = "above" if bet_type == "goals_over" else "below"
+        driver = ("offensive output and high-scoring rates for both sides"
+                  if bet_type == "goals_over"
+                  else "defensive profiles and lower expected outputs from both teams")
+        return (f"Predicted total of {pred:.1f} goals sits {diff:.1f} {side_word} "
+                f"the book's line of {line}. {driver.capitalize()} support the {direction}.")
+
+    return f"Model estimates {prob:.0%} probability with {edg:+.1%} de-juiced edge and {ev:+.1%} EV."
+
+
 def main():
     args = build_parser().parse_args()
 
@@ -106,26 +279,49 @@ def main():
 
     y_train = df_train_fe["result"].eq("W").astype(int)
 
-    # ── 4. Train one set of models per window ────────────────────────────────
-    print(f"\nTraining on {len(df_train_fe)} games across {data_loader.TRAIN_SEASONS}")
-    nan_rows = df_train_fe[[c for c in df_train_fe.columns if c.startswith("rolling_")]].isna().any(axis=1).sum()
+    # ── 4. Walk-forward validation (out-of-time signal check) ────────────────
+    _walk_forward_validation(df_train_fe, y_train)
+
+    # ── 5. Compute sample weights (recency + early-season ramp) ──────────────
+    sample_weights = compute_sample_weights(df_train_fe)
+    print(f"\nSample weights: min={sample_weights.min():.2f}  "
+          f"max={sample_weights.max():.2f}  mean={sample_weights.mean():.2f}")
+
+    # ── 6. Train / calibrate split ────────────────────────────────────────────
+    # True hold-out calibration: models must NEVER see calibration data during
+    # training, otherwise the calibrators adjust probabilities based on
+    # memorised patterns and cannot fix systematic overconfidence on new games.
+    #
+    #   0  …  74%   →  model training
+    #   75 … 89%   →  calibrator fitting  (cal_fit  — unseen by base models)
+    #   90 … 100%  →  method selection + threshold tuning  (cal_eval)
+    n_train      = len(df_train_fe)
+    model_cutoff = int(n_train * 0.75)
+    cal_start    = model_cutoff
+    eval_start   = int(n_train * 0.90)
+
+    df_model_fe  = df_train_fe.iloc[:model_cutoff]
+    y_model      = y_train.iloc[:model_cutoff]
+    sw_model     = sample_weights[:model_cutoff]
+
+    print(f"\nTraining on {len(df_model_fe)} games (first 75% of training data)")
+    nan_rows = df_model_fe[[c for c in df_model_fe.columns if c.startswith("rolling_")]].isna().any(axis=1).sum()
     print(f"  ({nan_rows} rows with NaN — handled by imputer in each pipeline)\n")
+    print(f"  Cal-fit : rows {cal_start}–{eval_start-1}  ({eval_start - cal_start} games, unseen by models)")
+    print(f"  Cal-eval: rows {eval_start}–{n_train-1}   ({n_train - eval_start} games)\n")
 
     all_models: dict = {}
     for w in evaluate.WINDOWS:
-        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_model_fe) if c in df_model_fe.columns]
         print(f"── Window N={w} | {len(feat_cols)} features ──────────────────────────")
-        all_models[w] = train.train_all(df_train_fe[feat_cols], y_train)
+        all_models[w] = train.train_all(df_model_fe[feat_cols], y_model,
+                                        sample_weight=sw_model)
 
-    # ── 5. Calibrate per window (Fix A: separate calibration-fit vs eval sets) ──
-    # Split last 20% of training into:
-    #   80–95% → fit the calibrator       (cal_fit)
-    #   95–100% → choose best method + threshold optimisation  (cal_eval)
-    # This prevents the calibrator from being selected based on data it memorised.
-    print("\nCalibrating models...")
-    n_train    = len(df_train_fe)
-    cal_start  = int(n_train * 0.80)
-    eval_start = int(n_train * 0.95)
+    # ── Log feature importances (XGB + LGBM, averaged across windows) ────────
+    _log_feature_importances(all_models, df_model_fe)
+
+    # ── 7. Calibrate per window (true hold-out: 75–90% unseen by base models) ──
+    print("\nCalibrating models (true hold-out data)...")
     calibrated: dict = {}
 
     for w, models in all_models.items():
@@ -140,8 +336,8 @@ def main():
             for name, m in models.items()
         }
 
-    # ── 6. Threshold optimisation (Fix B: use held-out eval set, not fit set) ──
-    print("\nOptimising decision thresholds (F-0.5, using held-out eval set)...")
+    # ── 8. Threshold optimisation (held-out eval set) ────────────────────────
+    print("\nOptimising decision thresholds (F-0.5, held-out eval set)...")
     for w, models in calibrated.items():
         feat_cols  = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
         X_cal_eval = df_train_fe[feat_cols].iloc[eval_start:]
@@ -151,7 +347,7 @@ def main():
             calibrated[w][name] = evaluate.ThresholdedModel(model, t)
             print(f"  N={w} {name}: threshold={t:.3f}")
 
-    # ── 7. Live validation + build ensemble weights (Fix F) ──────────────────
+    # ── 9. Live validation + build ensemble weights (Fix F) ──────────────────
     df_live = df_predict_fe[df_predict_fe["result"].notna()].copy()
     model_weights: dict | None = None
 
@@ -178,7 +374,7 @@ def main():
         results = pd.DataFrame()
         print("\nNo played 2025-26 games found for live validation.")
 
-    # ── 8. Predict upcoming games ─────────────────────────────────────────────
+    # ── 10. Predict upcoming games ───────────────────────────────────────────
     if not args.predict:
         return
 
@@ -220,10 +416,11 @@ def main():
     y_reg_win = (df_train_fe.loc[played_train, "result"].eq("W") &
                  df_train_fe.loc[played_train, "overtime_type"].eq("REG")).astype(int)
 
-    ot_model      = secondary.train_ot_model(X_sec_played, y_ot)
-    reg_win_model = secondary.train_reg_win_model(X_sec_played, y_reg_win)
+    ot_models      = secondary.train_ot_model(X_sec_played, y_ot)
+    reg_win_models = secondary.train_reg_win_model(X_sec_played, y_reg_win)
     print(f"  OT base rate (train): {y_ot.mean():.1%}  |  "
-          f"Reg-win base rate: {y_reg_win.mean():.1%}")
+          f"Reg-win base rate: {y_reg_win.mean():.1%}  |  "
+          f"ensemble: {len(ot_models)} models each")
 
     # ── 8c. Train totals / spread models (multi-window, calibrated ensemble) ──
     print("\nTraining spread / totals models (4 windows × 3 models each)...")
@@ -299,7 +496,7 @@ def main():
         n_win        = sum(1 for p in all_probs.values() if p >= 0.5)
         consensus    = f"{n_win}/{len(all_probs)} models predict WIN"
         prediction   = "WIN" if ensemble_p >= 0.5 else "LOSS"
-        conf_flag    = "▲ HIGH" if abs(ensemble_p - 0.5) > 0.08 else ("▶ MED" if abs(ensemble_p - 0.5) > 0.04 else "▼ LOW")
+        conf_flag    = "▲ HIGH" if ensemble_p > 0.63 else ("▶ MED" if ensemble_p > 0.57 else "▼ LOW")
 
         # Per-window average (cleaner breakdown than 16 rows)
         window_avgs = {}
@@ -319,9 +516,9 @@ def main():
               "  ".join(f"{k}: {v:.1%}" for k, v in window_avgs.items()))
 
         # ── OT / Regulation analysis ──────────────────────────────────────────
-        X_game = game[sec_feat_cols].to_frame().T
-        p_ot      = float(ot_model.predict_proba(X_game)[0][1])
-        p_reg_win = float(reg_win_model.predict_proba(X_game)[0][1])
+        X_game    = game[sec_feat_cols].to_frame().T
+        p_ot      = _secondary_prob(ot_models, X_game)
+        p_reg_win = _secondary_prob(reg_win_models, X_game)
 
         # Pull per-team OT profile from the best-window rolling features
         bw = best_window
@@ -439,23 +636,23 @@ def main():
         dj_away_imp = (betting.dejuiced_implied_prob(away_odds, home_odds)
                        if home_odds and away_odds else None)
 
-        MIN_EDGE = 0.05  # Fix D: minimum edge threshold
+        MIN_EDGE = 0.07  # minimum de-juiced edge to flag a bet
 
-        def _print_bet(label: str, p: float, odds: float, other_odds: float | None = None):
+        def _print_bet(label: str, p: float, odds: float,
+                       other_odds: float | None = None, context: dict | None = None):
             """
             Print EV/Kelly for one bet side.
-            Fix C: uses de-juiced edge when other_odds is available.
-            Fix D: only recommends bets where edge > MIN_EDGE AND confidence is not LOW.
+            context: extra fields stored in bet_summary for explanation generation.
             """
             imp        = betting.implied_prob(odds)
             ev         = betting.expected_value(p, odds)
             kf         = betting.kelly_fraction(p, odds)
             stake_full = kf * args.bankroll
             stake_half = kf * 0.5 * args.bankroll
-            dist       = abs(p - 0.5)
-            conf       = "▲ HIGH" if dist > 0.08 else ("▶ MED" if dist > 0.04 else "▼ LOW")
+            # Confidence reflects how likely THIS bet is to hit, not just model conviction.
+            # p < 0.5 should never be HIGH — you're not confident the bet wins.
+            conf = "▲ HIGH" if p > 0.63 else ("▶ MED" if p > 0.57 else "▼ LOW")
 
-            # De-juiced edge (Fix C)
             if other_odds is not None:
                 edg      = betting.edge_dejuiced(p, odds, other_odds)
                 edge_lbl = f"{edg:+.1%} (de-juiced)"
@@ -463,7 +660,6 @@ def main():
                 edg      = betting.edge(p, odds)
                 edge_lbl = f"{edg:+.1%}"
 
-            # Fix D: require minimum edge + non-LOW confidence to recommend
             is_value = (ev > 0) and (edg >= MIN_EDGE) and (conf != "▼ LOW")
             bet_flag = "✓ BET" if is_value else "✗ SKIP"
 
@@ -477,57 +673,95 @@ def main():
                 print(f"  Full Kelly stake     : {kf:.1%}   (${stake_full:,.2f})")
                 print(f"  Half Kelly stake     : {kf*0.5:.1%}   (${stake_half:,.2f})"
                       f"  ← recommended")
-                bet_summary.append({
+                entry = {
                     "game_key":   f"{game['team']} vs {game['opponent']}",
                     "matchup":    label,
                     "prob":       p,
                     "odds":       odds,
                     "ev":         ev,
+                    "edg":        edg,
+                    "kf":         kf,          # raw Kelly fraction (before portfolio scaling)
                     "full_kelly": stake_full,
                     "half_kelly": stake_half,
                     "conf":       conf,
-                })
+                }
+                if context:
+                    entry.update(context)
+                bet_summary.append(entry)
             print()
 
         print()
 
-        # Moneyline — pass other_odds for de-juiced edge (Fix C)
+        # Moneyline
         p_home = ensemble_p
         p_away = 1.0 - ensemble_p
+        ml_ctx = {
+            "bet_type":      "ml",
+            "n_consensus":   n_win,
+            "total_models":  len(all_probs),
+            "window_avgs":   window_avgs,
+            "home_team":     game["team"],
+            "away_team":     game["opponent"],
+        }
         if home_odds is not None:
             _print_bet(f"{game['team']} ML (home)", p_home, home_odds,
-                       other_odds=away_odds)
+                       other_odds=away_odds,
+                       context={**ml_ctx, "side": "home"})
         if away_odds is not None:
             _print_bet(f"{game['opponent']} ML (away)", p_away, away_odds,
-                       other_odds=home_odds)
+                       other_odds=home_odds,
+                       context={**ml_ctx, "side": "away"})
 
-        # Spread — de-juice using the opposite spread odds when both available
+        # Spread
+        spread_ctx_fav = {"bet_type": "spread_fav", "fav_team": fav_team, "dog_team": dog_team}
+        spread_ctx_dog = {"bet_type": "spread_dog", "fav_team": fav_team, "dog_team": dog_team}
         if fav_spread_odds is not None:
             _print_bet(f"{fav_team} -1.5 (spread)", p_fav_m15, fav_spread_odds,
-                       other_odds=dog_spread_odds)
+                       other_odds=dog_spread_odds, context=spread_ctx_fav)
         if dog_spread_odds is not None:
             _print_bet(f"{dog_team} +1.5 (spread)", p_dog_p15, dog_spread_odds,
-                       other_odds=fav_spread_odds)
+                       other_odds=fav_spread_odds, context=spread_ctx_dog)
 
-        # Total goals — de-juice using over/under as paired odds
+        # Total goals
         if goals_line is not None:
             p_over_goals  = totals.prob_over_goals(pred_total_goals, goals_line)
             p_under_goals = totals.prob_under(p_over_goals)
+            goals_ctx = {"pred_goals": pred_total_goals, "goals_line": goals_line}
             if goals_over_odds is not None:
                 _print_bet(f"Goals OVER  {goals_line}", p_over_goals, goals_over_odds,
-                           other_odds=goals_under_odds)
+                           other_odds=goals_under_odds,
+                           context={**goals_ctx, "bet_type": "goals_over"})
             if goals_under_odds is not None:
                 _print_bet(f"Goals UNDER {goals_line}", p_under_goals, goals_under_odds,
-                           other_odds=goals_over_odds)
+                           other_odds=goals_over_odds,
+                           context={**goals_ctx, "bet_type": "goals_under"})
 
     # ── Betting summary ───────────────────────────────────────────────────────
     if bet_summary:
-        total_half = sum(s["half_kelly"] for s in bet_summary)
-        total_full = sum(s["full_kelly"] for s in bet_summary)
+        # ── Portfolio-level stake scaling ─────────────────────────────────────
+        # Standard Kelly is derived assuming one bet at a time. When placing N
+        # simultaneous bets the individual fractions must be scaled so total
+        # exposure stays within a safe ceiling (25 % of bankroll).
+        # Scale factor = min(1, MAX_EXPOSURE / raw_total_half_frac).
+        MAX_EXPOSURE = 0.25  # never risk more than 25 % of bankroll in one session
+        raw_half_frac = sum(s["kf"] * 0.5 for s in bet_summary)
+        scale = min(1.0, MAX_EXPOSURE / raw_half_frac) if raw_half_frac > 0 else 1.0
+        scaled = scale < 1.0
+
+        for s in bet_summary:
+            s["adj_half_kelly"] = s["kf"] * 0.5 * scale * args.bankroll
+            s["adj_full_kelly"] = s["kf"]       * scale * args.bankroll
+
+        total_half = sum(s["adj_half_kelly"] for s in bet_summary)
+        total_full = sum(s["adj_full_kelly"] for s in bet_summary)
+
         print(f"\n{'═'*68}")
         print(f"  BETTING SUMMARY — {target_date.date()}")
         print(f"{'═'*68}")
         print(f"  Positive-EV bets   : {len(bet_summary)}")
+        if scaled:
+            print(f"  Portfolio scale    : {scale:.2f}×  "
+                  f"(raw total would be {raw_half_frac/1:.1%} → capped at {MAX_EXPOSURE:.0%})")
         print(f"  Total half-Kelly   : ${total_half:,.2f}  "
               f"({total_half/args.bankroll:.1%} of bankroll)")
         print(f"  Total full-Kelly   : ${total_full:,.2f}  "
@@ -539,7 +773,34 @@ def main():
         for rank, s in enumerate(ranked, 1):
             print(f"  {rank:<3} {s['game_key']:<24} {s['matchup']:<24} {s['conf']:<8}"
                   f" {s['prob']:>7.1%} {s['odds']:>6.2f} {s['ev']:>+7.1%}"
-                  f" {s['half_kelly']/args.bankroll:>8.1%} ${s['half_kelly']:>9.2f}")
+                  f" {s['adj_half_kelly']/args.bankroll:>8.1%} ${s['adj_half_kelly']:>9.2f}")
+
+        # ── Top picks with reasoning ──────────────────────────────────────────
+        # Composite score weights all three signals equally.
+        # score = EV + de-juiced edge + excess probability above 0.5
+        # All three in the same unit (fraction), so no normalisation needed.
+        def _top_score(s):
+            return s["ev"] + s["edg"] + (s["prob"] - 0.5)
+
+        top_picks = sorted(
+            [s for s in bet_summary
+             if s["conf"] == "▲ HIGH"
+             and s["ev"]  >= 0.10
+             and s["edg"] >= 0.10],
+            key=_top_score,
+            reverse=True,
+        )
+
+        if top_picks:
+            print(f"\n{'═'*68}")
+            print(f"  ★  TOP PICKS — highest conviction bets")
+            print(f"{'═'*68}")
+            for i, s in enumerate(top_picks, 1):
+                print(f"\n  {i}. {s['matchup']}  [{s['game_key']}]")
+                print(f"     {s['prob']:.0%} | EV {s['ev']:+.1%} | Edge {s['edg']:+.1%} | {s['conf']}")
+                print(f"     Recommended stake: ${s['adj_half_kelly']:,.2f}  "
+                      f"({s['adj_half_kelly']/args.bankroll:.1%} of bankroll)")
+                print(f"     {_explain_bet(s)}")
     elif args.predict:
         print(f"\n  No positive-EV bets found for {target_date.date()}.")
 

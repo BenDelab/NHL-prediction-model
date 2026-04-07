@@ -52,7 +52,7 @@ def _tscv(n_splits: int = 4) -> TimeSeriesSplit:
     return TimeSeriesSplit(n_splits=n_splits)
 
 
-def train_logistic(X_train, y_train) -> Pipeline:
+def train_logistic(X_train, y_train, sample_weight=None) -> Pipeline:
     pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
@@ -62,13 +62,13 @@ def train_logistic(X_train, y_train) -> Pipeline:
         pipe, LR_PARAM_GRID, n_iter=20, cv=_tscv(), scoring="average_precision",
         random_state=42, n_jobs=-1, refit=True,
     )
-    search.fit(X_train, y_train)
-    print(f"  [LR]   best params: {search.best_params_}  | cv acc: {search.best_score_:.4f}")
+    fit_params = {"model__sample_weight": sample_weight} if sample_weight is not None else {}
+    search.fit(X_train, y_train, **fit_params)
+    print(f"  [LR]   best params: {search.best_params_}  | cv AUC: {search.best_score_:.4f}")
     return search.best_estimator_
 
 
-
-def train_xgboost(X_train, y_train) -> Pipeline:
+def train_xgboost(X_train, y_train, sample_weight=None) -> Pipeline:
     pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model", XGBClassifier(random_state=42, eval_metric="logloss", n_jobs=-1)),
@@ -77,12 +77,13 @@ def train_xgboost(X_train, y_train) -> Pipeline:
         pipe, XGB_PARAM_GRID, n_iter=20, cv=_tscv(), scoring="average_precision",
         random_state=42, n_jobs=-1, refit=True,
     )
-    search.fit(X_train, y_train)
-    print(f"  [XGB]  best params: {search.best_params_}  | cv acc: {search.best_score_:.4f}")
+    fit_params = {"model__sample_weight": sample_weight} if sample_weight is not None else {}
+    search.fit(X_train, y_train, **fit_params)
+    print(f"  [XGB]  best params: {search.best_params_}  | cv AUC: {search.best_score_:.4f}")
     return search.best_estimator_
 
 
-def train_lightgbm(X_train, y_train) -> Pipeline:
+def train_lightgbm(X_train, y_train, sample_weight=None) -> Pipeline:
     pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model", LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1)),
@@ -91,8 +92,9 @@ def train_lightgbm(X_train, y_train) -> Pipeline:
         pipe, LGBM_PARAM_GRID, n_iter=20, cv=_tscv(), scoring="average_precision",
         random_state=42, n_jobs=-1, refit=True,
     )
-    search.fit(X_train, y_train)
-    print(f"  [LGBM] best params: {search.best_params_}  | cv acc: {search.best_score_:.4f}")
+    fit_params = {"model__sample_weight": sample_weight} if sample_weight is not None else {}
+    search.fit(X_train, y_train, **fit_params)
+    print(f"  [LGBM] best params: {search.best_params_}  | cv AUC: {search.best_score_:.4f}")
     return search.best_estimator_
 
 
@@ -126,35 +128,47 @@ class TemporalStacker:
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
 
-def train_stacking(X_train, y_train, base_models: dict) -> TemporalStacker:
+def train_stacking(X_train, y_train, base_models: dict,
+                   sample_weight=None) -> TemporalStacker:
     """
     Fit meta-learner on the last 30% of training data (temporal hold-out).
     """
-    import pandas as pd
     n     = len(X_train)
     split = int(n * 0.7)
 
     X_meta = X_train.iloc[split:] if hasattr(X_train, "iloc") else X_train[split:]
     y_meta = y_train.iloc[split:] if hasattr(y_train, "iloc") else y_train[split:]
 
+    sw_meta = None
+    if sample_weight is not None:
+        sw_meta = (sample_weight.iloc[split:]
+                   if hasattr(sample_weight, "iloc")
+                   else sample_weight[split:])
+
     meta_features = np.column_stack([
         m.predict_proba(X_meta)[:, 1] for m in base_models.values()
     ])
 
     meta_lr = LogisticRegression(C=1.0, max_iter=2000, random_state=42)
-    meta_lr.fit(meta_features, y_meta)
+    meta_lr.fit(meta_features, y_meta, sample_weight=sw_meta)
 
     stacker = TemporalStacker(base_models, meta_lr)
     print(f"  [Stack] temporal meta-learner trained on last 30% ({len(X_meta)} games)")
     return stacker
 
 
-def train_all(X_train, y_train) -> dict:
-    """Train LR, XGB, LGBM and a temporal stacking ensemble. Returns {name: fitted_pipeline}."""
-    base = {
-        "Logistic Regression": train_logistic(X_train, y_train),
-        "XGBoost":             train_xgboost(X_train, y_train),
-        "LightGBM":            train_lightgbm(X_train, y_train),
+def train_all(X_train, y_train, sample_weight=None) -> dict:
+    """
+    Train LR, XGB, LightGBM.  Returns {name: fitted_pipeline}.
+
+    TemporalStacker is excluded: the current implementation feeds the meta-learner
+    base-model predictions on data those models already trained on (last 30% of
+    X_train), producing memorised meta-features and systematic overconfidence on
+    unseen games.  The 12-model ensemble (3 classifiers × 4 windows) is robust
+    without adding a biased stacking layer.
+    """
+    return {
+        "Logistic Regression": train_logistic(X_train, y_train, sample_weight),
+        "XGBoost":             train_xgboost(X_train, y_train, sample_weight),
+        "LightGBM":            train_lightgbm(X_train, y_train, sample_weight),
     }
-    stack = train_stacking(X_train, y_train, base)
-    return {**base, "Stacking Ensemble": stack}

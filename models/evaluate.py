@@ -50,13 +50,24 @@ def get_feature_cols_for_window(window: int, df: pd.DataFrame) -> list:
     opp_pref = f"opp_rolling_{window}_"
     rolling  = [c for c in df.columns if c.startswith(prefix) or c.startswith(opp_pref)]
     static   = [
-        "days_since_last_game", "game_number_in_season",
+        # schedule / fatigue — home team
+        "days_since_last_game", "back_to_back", "games_in_last_10",
+        "game_number_in_season",
+        # schedule / fatigue — opponent (joined via add_opponent_features)
+        "opp_days_since_last_game", "opp_back_to_back", "opp_games_in_last_10",
+        # schedule differential
+        "rest_advantage", "b2b_disadvantage", "workload_advantage",
+        # season-level
         "pp_opportunity_rate", "h2h_win_pct", "win_streak",
-        "back_to_back", "season_win_pct", "opp_season_win_pct",
-        "opp_win_streak",
+        "season_win_pct", "opp_season_win_pct", "opp_win_streak",
+        # momentum
         "momentum_5v20", "momentum_5v10", "momentum_10v20",
         "momentum_5v15", "momentum_10v15",
         "ewm_momentum_5v20", "ewm_momentum_5v10",
+        # PDO / efficiency regression-to-mean
+        "pdo_regress_5v20", "pdo_regress_5v10", "pdo_regress_10v20",
+        "shoot_regress_5v20", "shoot_regress_5v10", "shoot_regress_10v20",
+        "save_regress_5v20", "save_regress_5v10", "save_regress_10v20",
     ]
     static = [c for c in static if c in df.columns]
     return rolling + static

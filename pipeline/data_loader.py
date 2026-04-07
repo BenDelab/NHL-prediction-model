@@ -52,5 +52,3 @@ def load_train() -> pd.DataFrame:
     return df
 
 
-def load_test() -> pd.DataFrame:
-    return load_season(TEST_SEASON)

@@ -165,31 +165,65 @@ def compute_team_features(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts).sort_values(["season", "date", "team"]).reset_index(drop=True)
 
 
+def _build_full_schedule(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reconstruct each team's COMPLETE game dates from:
+      - rows where team == T  (home appearances)
+      - rows where opponent == T  (away appearances)
+
+    The CSV files contain only home-game rows, so computing rest purely from
+    home-to-home gaps ignores all away games played in between — a team that
+    looks like they had 10 days off may have actually played 3 road games.
+    """
+    home = df[["team", "season", "date"]].copy()
+    away = (df[["opponent", "season", "date"]]
+            .rename(columns={"opponent": "team"})
+            .copy())
+    full = (pd.concat([home, away], ignore_index=True)
+              .drop_duplicates(subset=["team", "season", "date"])
+              .sort_values(["team", "season", "date"])
+              .reset_index(drop=True))
+    full["prev_game_date"] = full.groupby(["team", "season"])["date"].shift(1)
+    return full
+
+
 def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add non-rolling derived features (schedule context, season-level rates)."""
     df = df.sort_values(["team", "season", "date"]).copy()
 
-    df["days_since_last_game"] = (
-        df.groupby(["team", "season"])["date"].diff().dt.days.fillna(3)
+    # ── Full-schedule rest features ───────────────────────────────────────────
+    # Use home + away appearances so rest / workload reflect the real calendar.
+    full_sched = _build_full_schedule(df)
+
+    # days_since_last_game and back_to_back from true previous game
+    df = df.merge(
+        full_sched[["team", "season", "date", "prev_game_date"]],
+        on=["team", "season", "date"],
+        how="left",
     )
+    df["days_since_last_game"] = (
+        (df["date"] - df["prev_game_date"]).dt.days.fillna(3)
+    )
+    df["back_to_back"] = (df["days_since_last_game"] <= 1).astype(int)
+    df.drop(columns=["prev_game_date"], inplace=True)
+
+    # games_in_last_10: count ALL games (home + away) in the 10 days before each home game
+    sched_map: dict = {}
+    for (team, season), grp in full_sched.groupby(["team", "season"]):
+        sched_map[(team, season)] = grp["date"].values.astype("datetime64[D]")
+
+    g10: list = []
+    for _, row in df.iterrows():
+        key  = (row["team"], row["season"])
+        game_date = np.datetime64(row["date"], "D")
+        all_dates = sched_map.get(key, np.array([], dtype="datetime64[D]"))
+        cutoff = game_date - np.timedelta64(10, "D")
+        count = int(np.sum((all_dates >= cutoff) & (all_dates < game_date)))
+        g10.append(count)
+    df["games_in_last_10"] = g10
+
     df["game_number_in_season"] = df["game_num"]
     df["pp_opportunity_rate"]   = df["team_ppo"] / (df["team_ppo"] + df["opp_ppo"] + 1e-9)
-    df["back_to_back"]          = (df["days_since_last_game"] <= 1).astype(int)
-
-    # Rolling 10-day workload: games played in the 10 calendar days before each game
-    def _count_last_10(dates: pd.Series) -> pd.Series:
-        arr = dates.values.astype("datetime64[D]")
-        result = np.zeros(len(arr), dtype=int)
-        for i in range(len(arr)):
-            cutoff = arr[i] - np.timedelta64(10, "D")
-            result[i] = int(np.sum((arr[:i] >= cutoff) & (arr[:i] < arr[i])))
-        return pd.Series(result, index=dates.index)
-
-    df["games_in_last_10"] = (
-        df.groupby(["team", "season"])["date"]
-        .transform(_count_last_10)
-        .fillna(0)
-    )
 
     # Cumulative season win rate (expanding, shift(1) via transform)
     df["season_win_pct"] = (
@@ -240,7 +274,10 @@ def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_opponent_features(df: pd.DataFrame) -> pd.DataFrame:
     """Join each game's opponent's most recent rolling + season features."""
     rolling_cols = [c for c in df.columns if c.startswith("rolling_")]
-    extra_cols   = [c for c in ["season_win_pct", "win_streak"] if c in df.columns]
+    extra_cols   = [c for c in [
+        "season_win_pct", "win_streak",
+        "days_since_last_game", "back_to_back", "games_in_last_10",
+    ] if c in df.columns]
     team_cols    = rolling_cols + extra_cols
 
     opp_df = df[["season", "date", "team"] + team_cols].copy()
@@ -284,6 +321,40 @@ def add_h2h_features(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["win_binary"])
 
 
+def add_regression_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    PDO and efficiency regression-to-mean signals.
+    short_window - long_window: positive = current metric inflated vs baseline → likely to regress.
+    Useful for identifying teams on unsustainable shooting/goaltending runs.
+    """
+    pairs = [(5, 20), (5, 10), (10, 20)]
+    stats = [("pdo", "pdo_regress"), ("shooting_pct", "shoot_regress"), ("save_pct", "save_regress")]
+    for ws, wl in pairs:
+        for raw_stat, prefix in stats:
+            sc = f"rolling_{ws}_{raw_stat}"
+            lc = f"rolling_{wl}_{raw_stat}"
+            if sc in df.columns and lc in df.columns:
+                df[f"{prefix}_{ws}v{wl}"] = df[sc] - df[lc]
+    return df
+
+
+def add_schedule_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Schedule-context differential features.
+    Requires opponent features already joined (opp_days_since_last_game etc. must exist).
+    Computes rest / fatigue edge between home team and opponent.
+    """
+    if "days_since_last_game" in df.columns and "opp_days_since_last_game" in df.columns:
+        df["rest_advantage"] = df["days_since_last_game"] - df["opp_days_since_last_game"]
+    if "back_to_back" in df.columns and "opp_back_to_back" in df.columns:
+        # positive = home team is on a B2B and opponent is not
+        df["b2b_disadvantage"] = df["back_to_back"] - df["opp_back_to_back"]
+    if "games_in_last_10" in df.columns and "opp_games_in_last_10" in df.columns:
+        # positive = opponent is more fatigued
+        df["workload_advantage"] = df["opp_games_in_last_10"] - df["games_in_last_10"]
+    return df
+
+
 def add_differential_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Home team minus opponent for key rolling metrics.
@@ -320,9 +391,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = compute_team_features(df)
     df = add_derived_features(df)
     df = add_streak_features(df)
-    df = add_opponent_features(df)
+    df = add_opponent_features(df)        # opp_* schedule cols created here
     df = add_h2h_features(df)
     df = add_momentum_features(df)
+    df = add_regression_features(df)      # PDO / efficiency regression signals
+    df = add_schedule_features(df)        # rest / fatigue diffs vs opponent
     df = add_differential_features(df)
     return df
 
