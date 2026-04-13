@@ -57,9 +57,19 @@ def get_feature_cols_for_window(window: int, df: pd.DataFrame) -> list:
         "opp_days_since_last_game", "opp_back_to_back", "opp_games_in_last_10",
         # schedule differential
         "rest_advantage", "b2b_disadvantage", "workload_advantage",
+        # Elo power rankings (cumulative across all seasons)
+        "home_elo", "away_elo", "elo_diff", "elo_win_prob",
         # season-level
         "pp_opportunity_rate", "h2h_win_pct", "win_streak",
         "season_win_pct", "opp_season_win_pct", "opp_win_streak",
+        # playoff motivation / standings pressure
+        "points", "games_remaining", "conf_rank", "points_above_cut",
+        "clinch_status", "motivation",
+        "opp_points", "opp_games_remaining", "opp_conf_rank",
+        "opp_points_above_cut", "opp_clinch_status", "opp_motivation",
+        "motivation_diff", "pts_above_cut_diff",
+        "is_tanking", "is_must_win", "is_clinched",
+        "opp_is_tanking", "opp_is_must_win", "opp_is_clinched",
         # momentum
         "momentum_5v20", "momentum_5v10", "momentum_10v20",
         "momentum_5v15", "momentum_10v15",

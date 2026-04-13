@@ -36,12 +36,13 @@ from lightgbm import LGBMClassifier, LGBMRegressor
 
 # ── spread ensemble (binary classification) ──────────────────────────────────
 
-def train_spread_ensemble(X: pd.DataFrame, y: pd.Series) -> dict:
+def train_spread_ensemble(X: pd.DataFrame, y: pd.Series,
+                          sample_weight=None) -> dict:
     """
-    Train LR + XGBoost + LightGBM classifiers with fixed good params.
-    Returns {name: fitted_pipeline}.
-    No RandomizedSearchCV — speed is prioritised; reliability comes from the
-    multi-window + calibration + ensemble averaging done in main.py.
+    LR + shallow XGB + shallow LGBM for spread prediction.
+    Covering -1.5 is non-linear (blowout rates depend on matchup gaps, xG
+    differentials, PP/PK edges) so tree models with limited depth add signal.
+    max_depth=3 prevents overfitting on ~5,000 games.
     """
     lr = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -52,16 +53,18 @@ def train_spread_ensemble(X: pd.DataFrame, y: pd.Series) -> dict:
     xgb = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model",   XGBClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
-            eval_metric="logloss", random_state=42, n_jobs=-1, verbosity=0,
+            max_depth=3, n_estimators=200, learning_rate=0.05,
+            subsample=0.7, colsample_bytree=0.7,
+            reg_alpha=0.1, reg_lambda=2.0,
+            random_state=42, eval_metric="logloss", n_jobs=-1,
         )),
     ])
     lgbm = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model",   LGBMClassifier(
-            n_estimators=200, num_leaves=31, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, min_child_samples=20,
+            max_depth=3, num_leaves=15, n_estimators=200, learning_rate=0.05,
+            subsample=0.7, colsample_bytree=0.7,
+            reg_alpha=0.1, reg_lambda=2.0,
             random_state=42, n_jobs=-1, verbose=-1,
         )),
     ])
@@ -71,45 +74,39 @@ def train_spread_ensemble(X: pd.DataFrame, y: pd.Series) -> dict:
         "LightGBM":            lgbm,
     }
     for name, m in models.items():
-        m.fit(X, y)
+        fit_params = {}
+        if sample_weight is not None:
+            if name == "Logistic Regression":
+                fit_params["model__sample_weight"] = sample_weight
+            else:
+                fit_params["model__sample_weight"] = sample_weight
+        m.fit(X, y, **fit_params)
     return models
 
 
 # ── goals regression ensemble ─────────────────────────────────────────────────
 
-def train_regression_all(X: pd.DataFrame, y: pd.Series) -> dict:
+def train_regression_all(X: pd.DataFrame, y: pd.Series,
+                         sample_weight=None) -> dict:
     """
-    Train Ridge + XGBRegressor + LGBMRegressor with fixed params.
-    Returns {name: fitted_pipeline}.
+    Ridge only for goals regression.
+    Backtested on 2024-25 (1,312 games): Ridge alone gives 52.8% totals accuracy
+    with near-neutral over bias (51%). Adding XGB/LGBM pushes over bias to 59%
+    and drops accuracy — tree models over-learn xGF signals and inflate predictions.
+    Shrinkage toward median also hurts accuracy despite reducing MAE.
+    Ridge's conservatism is the correct behaviour given hockey's high randomness.
     """
     ridge = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler",  StandardScaler()),
         ("model",   Ridge(alpha=1.0)),
     ])
-    xgb = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model",   XGBRegressor(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8,
-            random_state=42, n_jobs=-1, verbosity=0,
-        )),
-    ])
-    lgbm = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("model",   LGBMRegressor(
-            n_estimators=200, num_leaves=31, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, min_child_samples=20,
-            random_state=42, n_jobs=-1, verbose=-1,
-        )),
-    ])
-    models = {
-        "Ridge":    ridge,
-        "XGBoost":  xgb,
-        "LightGBM": lgbm,
-    }
+    models = {"Ridge": ridge}
     for name, m in models.items():
-        m.fit(X, y)
+        fit_params = {}
+        if sample_weight is not None:
+            fit_params["model__sample_weight"] = sample_weight
+        m.fit(X, y, **fit_params)
     return models
 
 

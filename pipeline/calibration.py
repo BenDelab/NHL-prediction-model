@@ -1,97 +1,83 @@
 """
-Probability calibration — Platt scaling (sigmoid) vs isotonic regression.
+Probability calibration via temperature scaling.
 
-Fix A: calibration method selection now uses a separate held-out evaluation set
-(X_eval / y_eval) rather than the same data used to fit the calibrator.
-This prevents the calibrator from always appearing to improve on its own training
-data — isotonic regression in particular memorises small datasets perfectly,
-giving a falsely low Brier score and being selected when it shouldn't be.
+Why temperature scaling instead of isotonic / sigmoid:
+────────────────────────────────────────────────────────
+Isotonic regression fits a step function on the calibration set.  On NHL data
+the step function collapses the entire upper tail (raw p > 0.55) to a single
+plateau value (~0.55), destroying all discrimination among high-confidence
+predictions.  Sigmoid (Platt) scaling collapses the spread in the opposite
+direction, pushing everything below 0.54.
+
+Temperature scaling is a single-parameter method:
+    calibrated_p = sigmoid( logit(raw_p) / T )
+
+where T > 1 reduces overconfidence and T < 1 increases it.  Crucially it
+preserves the RANKING of predictions — a game the model rates higher stays
+higher — while correcting the absolute probability scale.  This is the
+correct approach when the goal is both good calibration AND discriminative
+power for high-confidence picks.
 """
 
 import numpy as np
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import brier_score_loss
+from scipy.optimize import minimize_scalar
+from scipy.special import expit, logit
 
 
-def _try_calibrate(model, X_cal, y_cal, method: str):
-    """Fit one calibration method on (X_cal, y_cal). Returns fitted calibrator."""
-    try:
-        cal = CalibratedClassifierCV(model, method=method, cv="prefit")
-        cal.fit(X_cal, y_cal)
-        return cal
-    except (ValueError, TypeError):
-        pass
+def _nll(T, raw_probs, y):
+    """Negative log-likelihood of temperature-scaled probabilities."""
+    p = expit(logit(np.clip(raw_probs, 1e-6, 1 - 1e-6)) / T)
+    p = np.clip(p, 1e-7, 1 - 1e-7)
+    return -np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
 
-    # sklearn >= 1.6 removed cv="prefit" — manual fallback
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.isotonic import IsotonicRegression
 
-    probs = model.predict_proba(X_cal)[:, 1]
+def _fit_temperature(raw_probs, y):
+    """Find the temperature T that minimises NLL on (raw_probs, y)."""
+    result = minimize_scalar(_nll, bounds=(0.1, 10.0), method="bounded",
+                             args=(raw_probs, y))
+    return float(result.x)
 
-    if method == "sigmoid":
-        lr = LogisticRegression(max_iter=1000)
-        lr.fit(probs.reshape(-1, 1), y_cal)
 
-        class _SigmoidCal:
-            def __init__(self, base, lr):
-                self._base, self._lr = base, lr
-            def predict(self, X):
-                return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-            def predict_proba(self, X):
-                p = self._base.predict_proba(X)[:, 1].reshape(-1, 1)
-                return self._lr.predict_proba(p)
+class TemperatureScaler:
+    """Wraps a fitted model; applies temperature scaling at predict time."""
 
-        return _SigmoidCal(model, lr)
+    def __init__(self, model, T: float):
+        self._model = model
+        self.T = T
 
-    else:  # isotonic
-        iso = IsotonicRegression(out_of_bounds="clip")
-        iso.fit(probs, y_cal)
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
-        class _IsotonicCal:
-            def __init__(self, base, iso):
-                self._base, self._iso = base, iso
-            def predict(self, X):
-                return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-            def predict_proba(self, X):
-                p = self._base.predict_proba(X)[:, 1]
-                cal_p = np.clip(self._iso.predict(p), 0, 1)
-                return np.column_stack([1 - cal_p, cal_p])
-
-        return _IsotonicCal(model, iso)
+    def predict_proba(self, X):
+        raw = self._model.predict_proba(X)[:, 1]
+        cal = expit(logit(np.clip(raw, 1e-6, 1 - 1e-6)) / self.T)
+        cal = np.clip(cal, 0.0, 1.0)
+        return np.column_stack([1 - cal, cal])
 
 
 def calibrate(model, X_cal, y_cal, X_eval=None, y_eval=None):
     """
-    Fit sigmoid and isotonic calibrators on (X_cal, y_cal).
-    Select the best method by Brier score on (X_eval, y_eval).
+    Fit temperature scaling on (X_cal, y_cal).
+    X_eval / y_eval are accepted for API compatibility but not used —
+    temperature scaling has only one parameter so hold-out selection is
+    unnecessary (no overfitting risk).
 
-    X_eval / y_eval should be a separate held-out set not used for fitting —
-    this prevents leakage where the calibrator always looks better on its own
-    training data. Falls back to X_cal if X_eval is not provided.
+    Returns a TemperatureScaler wrapping the original model.
     """
-    if X_eval is None or y_eval is None:
-        X_eval, y_eval = X_cal, y_cal
+    raw_probs = model.predict_proba(X_cal)[:, 1]
+    T = _fit_temperature(raw_probs, np.array(y_cal))
 
-    raw_brier  = brier_score_loss(y_eval, model.predict_proba(X_eval)[:, 1])
-    best_model  = model
-    best_brier  = raw_brier
-    best_method = "none (raw)"
+    from sklearn.metrics import brier_score_loss
+    raw_brier = brier_score_loss(y_cal, raw_probs)
+    cal_probs = expit(logit(np.clip(raw_probs, 1e-6, 1 - 1e-6)) / T)
+    cal_brier = brier_score_loss(y_cal, cal_probs)
+    improvement = raw_brier - cal_brier
 
-    for method in ("sigmoid", "isotonic"):
-        try:
-            cal = _try_calibrate(model, X_cal, y_cal, method)   # fit on X_cal
-            b   = brier_score_loss(y_eval, cal.predict_proba(X_eval)[:, 1])  # eval on X_eval
-            if b < best_brier:
-                best_brier  = b
-                best_model  = cal
-                best_method = method
-        except Exception:
-            pass
-
-    improvement = raw_brier - best_brier
-    print(f"    calibration: {best_method} | Brier {raw_brier:.4f} → {best_brier:.4f} "
+    print(f"    calibration: temperature T={T:.3f} | "
+          f"Brier {raw_brier:.4f} → {cal_brier:.4f} "
           f"({'−' if improvement >= 0 else '+'}{abs(improvement):.4f})")
-    return best_model
+
+    return TemperatureScaler(model, T)
 
 
 def calibration_curve_data(y_true, y_prob, n_bins: int = 10):

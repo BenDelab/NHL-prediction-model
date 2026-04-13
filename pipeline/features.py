@@ -304,6 +304,70 @@ def add_opponent_features(df: pd.DataFrame) -> pd.DataFrame:
     return merged.rename(columns={"opponent_key": "opponent"})
 
 
+def add_elo_features(df: pd.DataFrame,
+                     k: float = 5.0,
+                     home_adv: float = 60.0,
+                     season_regress: float = 0.33,
+                     start_elo: float = 1500.0) -> pd.DataFrame:
+    """
+    Compute pre-game Elo ratings for every team across all seasons.
+
+    Parameters
+    ----------
+    k              : update factor per game (NHL ~5 — high randomness, slow updates)
+    home_adv       : Elo points added to home team's expected win probability
+    season_regress : fraction of Elo deviation from 1500 regressed to mean each
+                     new season (0.33 → a team at 1560 starts next season at 1540)
+    start_elo      : initial rating for all teams
+
+    Adds columns
+    ------------
+    home_elo       : home team Elo entering this game
+    away_elo       : away team Elo entering this game (opponent)
+    elo_diff       : home_elo - away_elo
+    elo_win_prob   : Elo-implied P(home wins) including home ice advantage
+    """
+    df = df.sort_values(["date", "season"]).copy()
+    elos: dict = {}          # team -> current elo
+    home_elo_col   = []
+    away_elo_col   = []
+
+    prev_season = None
+
+    for _, row in df.iterrows():
+        season = row["season"]
+        team   = row["team"]
+        opp    = row["opponent"]
+
+        # Season-start regression to mean
+        if season != prev_season:
+            prev_season = season
+            for t in list(elos.keys()):
+                elos[t] = elos[t] + season_regress * (start_elo - elos[t])
+
+        h_elo = elos.get(team, start_elo)
+        a_elo = elos.get(opp,  start_elo)
+
+        home_elo_col.append(h_elo)
+        away_elo_col.append(a_elo)
+
+        # Update only for played games
+        if pd.notna(row.get("result")):
+            expected_h = 1.0 / (1.0 + 10.0 ** ((a_elo - h_elo - home_adv) / 400.0))
+            actual_h   = 1.0 if row["result"] == "W" else 0.0
+            delta      = k * (actual_h - expected_h)
+            elos[team] = h_elo + delta
+            elos[opp]  = a_elo - delta
+
+    df["home_elo"]     = home_elo_col
+    df["away_elo"]     = away_elo_col
+    df["elo_diff"]     = df["home_elo"] - df["away_elo"]
+    df["elo_win_prob"] = 1.0 / (1.0 + 10.0 ** (
+        (df["away_elo"] - df["home_elo"] - home_adv) / 400.0
+    ))
+    return df
+
+
 def add_h2h_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add head-to-head historical win rate of home team vs opponent."""
     df = df.sort_values(["season", "date"]).copy()
@@ -355,6 +419,67 @@ def add_schedule_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_xg_features(df: pd.DataFrame, xg_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute rolling xG features from MoneyPuck game-by-game data and join to df.
+
+    xg_df contains one row per (team, date) for BOTH home and away games, so
+    rolling windows reflect true recent form — not just home appearances.
+    The rolling values are shift(1) before the window to prevent leakage.
+
+    Features added per window (all prefixed rolling_{w}_):
+      xgf_ev, xga_ev, xgp_ev          — even strength quality
+      xgf_pp, xga_pp                   — power play offense / PK from opp view
+      xgf_pk, xga_pk                   — penalty kill
+      xgf_all, xga_all, xgp_all        — all-situations totals
+      xg_combined_all                  — xgf_all + xga_all (total expected goals)
+    """
+    if xg_df is None or xg_df.empty:
+        return df
+
+    xg_base_cols = [c for c in xg_df.columns
+                    if c.startswith("xg") and c not in ("xg_combined_all",)]
+    if "xg_combined_all" in xg_df.columns:
+        xg_base_cols.append("xg_combined_all")
+
+    parts = []
+    for (team, season), grp in xg_df.groupby(["team", "season"]):
+        grp = grp.sort_values("date").copy()
+        new_cols = []
+        for col in xg_base_cols:
+            if col not in grp.columns:
+                continue
+            shifted = grp[col].shift(1)
+            for w in WINDOWS:
+                feat = f"rolling_{w}_{col}"
+                grp[feat] = shifted.rolling(w, min_periods=1).mean()
+                new_cols.append(feat)
+        parts.append(grp[["team", "season", "date"] + new_cols])
+
+    if not parts:
+        return df
+
+    rolling_xg = pd.concat(parts, ignore_index=True).sort_values(["team", "season", "date"])
+
+    # merge_asof (backward): for each game row in df, pick the most recent xG rolling
+    # values on or before that date. This correctly handles upcoming games (no xG entry
+    # yet) by carrying forward the last known rolling average.
+    merged_parts = []
+    for season, s_df in df.groupby("season"):
+        xg_s = rolling_xg[rolling_xg["season"] == season].sort_values("date").drop(columns=["season"])
+        result = pd.merge_asof(
+            s_df.sort_values("date"),
+            xg_s,
+            on="date",
+            by="team",
+            direction="backward",
+        )
+        merged_parts.append(result)
+
+    df = pd.concat(merged_parts).sort_values(["season", "date", "team"]).reset_index(drop=True)
+    return df
+
+
 def add_differential_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Home team minus opponent for key rolling metrics.
@@ -386,12 +511,97 @@ def add_differential_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Full feature engineering pipeline."""
+def add_standings_features(df: pd.DataFrame,
+                           standings_df: "pd.DataFrame | None" = None) -> pd.DataFrame:
+    """
+    Join playoff motivation features to each game row using merge_asof (backward).
+
+    For each game, finds the most recent standings snapshot before that date and
+    joins: points, games_remaining, conf_rank, points_above_cut, clinch_status,
+    motivation — for both home team and opponent (via opp_ prefix).
+
+    standings_df: output of standings.build_standings_features(). If None,
+                  loads from cached CSVs automatically.
+    """
+    from pipeline.standings import build_standings_features, load_all_standings
+
+    if standings_df is None:
+        raw = load_all_standings()
+        if raw.empty:
+            return df
+        standings_df = build_standings_features(raw)
+
+    if standings_df.empty:
+        return df
+
+    feat_cols = ["points", "games_remaining", "conf_rank",
+                 "points_above_cut", "clinch_status", "motivation"]
+    feat_cols = [c for c in feat_cols if c in standings_df.columns]
+
+    merged_parts = []
+    for season, s_df in df.groupby("season"):
+        st_s = (standings_df[standings_df["season"] == season]
+                .sort_values("date")
+                .copy())
+        if st_s.empty:
+            merged_parts.append(s_df)
+            continue
+
+        # Home team standings
+        home_st = st_s[["team", "date"] + feat_cols].copy()
+        result = pd.merge_asof(
+            s_df.sort_values("date"),
+            home_st.sort_values("date"),
+            on="date",
+            by="team",
+            direction="backward",
+        )
+
+        # Opponent standings (join on opponent key)
+        opp_st = st_s[["team", "date"] + feat_cols].rename(
+            columns={"team": "opponent"} | {c: f"opp_{c}" for c in feat_cols}
+        )
+        result = pd.merge_asof(
+            result.sort_values("date"),
+            opp_st.sort_values("date"),
+            on="date",
+            by="opponent",
+            direction="backward",
+        )
+
+        # Derived: motivation differential (home − away)
+        if "motivation" in result.columns and "opp_motivation" in result.columns:
+            result["motivation_diff"] = result["motivation"] - result["opp_motivation"]
+        if "points_above_cut" in result.columns and "opp_points_above_cut" in result.columns:
+            result["pts_above_cut_diff"] = result["points_above_cut"] - result["opp_points_above_cut"]
+
+        merged_parts.append(result)
+
+    if not merged_parts:
+        return df
+    return (pd.concat(merged_parts)
+              .sort_values(["season", "date", "team"])
+              .reset_index(drop=True))
+
+
+def build_features(df: pd.DataFrame,
+                   xg_df: "pd.DataFrame | None" = None) -> pd.DataFrame:
+    """
+    Full feature engineering pipeline.
+
+    xg_df: optional MoneyPuck game-by-game xG DataFrame from xg_loader.
+           When provided, rolling xG features are computed over ALL team games
+           (home + away) and joined before add_opponent_features so that
+           opp_rolling_*_xg* columns are created automatically.
+    """
     df = compute_team_features(df)
     df = add_derived_features(df)
     df = add_streak_features(df)
-    df = add_opponent_features(df)        # opp_* schedule cols created here
+    if xg_df is not None and not xg_df.empty:
+        df = add_xg_features(df, xg_df)   # before opponent join → opp_xg_ auto-created
+    df = add_opponent_features(df)        # opp_* schedule + xG cols created here
+    df = add_standings_features(df)       # motivation / playoff pressure features
+    df = add_elo_features(df)             # cumulative power rankings across all seasons
     df = add_h2h_features(df)
     df = add_momentum_features(df)
     df = add_regression_features(df)      # PDO / efficiency regression signals
