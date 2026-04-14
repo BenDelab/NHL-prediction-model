@@ -71,14 +71,18 @@ def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
     df[f"{p}_gf_ga_ratio"]       = df[f"{p}_goals_for_avg"] / (df[f"{p}_goals_against_avg"] + 0.01)
 
     # Game-profile rates (shift already applied to gf/ga)
-    shutout    = ga.eq(0).astype(float)           # held opponent scoreless
-    high_score = gf.ge(3).astype(float)           # scored 3+
-    blowout_w  = (gf - ga).ge(3).astype(float)    # won by 3+
-    close_game = (gf - ga).abs().le(1).astype(float)  # 1-goal margin
-    df[f"{p}_shutout_rate"]      = rm(shutout)    # P(keep opponent to 0)
-    df[f"{p}_high_scoring_rate"] = rm(high_score) # P(score 3+)
-    df[f"{p}_blowout_win_rate"]  = rm(blowout_w)  # P(dominant win)
-    df[f"{p}_close_game_rate"]   = rm(close_game) # P(1-goal game)
+    shutout       = ga.eq(0).astype(float)            # held opponent scoreless
+    high_score    = gf.ge(3).astype(float)            # scored 3+
+    blowout_w     = (gf - ga).ge(3).astype(float)     # won by 3+
+    close_game    = (gf - ga).abs().le(1).astype(float)  # 1-goal margin
+    win_by_2plus  = (gf - ga).ge(2).astype(float)    # won by 2+ (covers puck line -1.5)
+    lose_by_2plus = (ga - gf).ge(2).astype(float)    # lost by 2+ (opp covers -1.5)
+    df[f"{p}_shutout_rate"]      = rm(shutout)        # P(keep opponent to 0)
+    df[f"{p}_high_scoring_rate"] = rm(high_score)     # P(score 3+)
+    df[f"{p}_blowout_win_rate"]  = rm(blowout_w)      # P(dominant win)
+    df[f"{p}_close_game_rate"]   = rm(close_game)     # P(1-goal game)
+    df[f"{p}_win_by_2plus_rate"] = rm(win_by_2plus)   # P(cover -1.5) — direct spread signal
+    df[f"{p}_lose_by_2plus_rate"]= rm(lose_by_2plus)  # P(opp covers -1.5)
 
     # EWM goal differential (how recent margin trend compares to rolling average)
     goal_diff_raw = gf - ga
@@ -369,13 +373,21 @@ def add_elo_features(df: pd.DataFrame,
 
 
 def add_h2h_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add head-to-head historical win rate of home team vs opponent."""
+    """
+    Add head-to-head win rate of home team vs opponent within the current season.
+    Reset each season so prior-season history doesn't leak into future seasons.
+    """
     df = df.sort_values(["season", "date"]).copy()
     df["win_binary"] = df["result"].eq("W").astype(int)
 
     cumulative: dict = {}
+    prev_season = None
     h2h = []
     for _, row in df.iterrows():
+        # Reset on new season — prevents cross-season leakage
+        if row["season"] != prev_season:
+            cumulative = {}
+            prev_season = row["season"]
         key = (row["team"], row["opponent"])
         wins, games = cumulative.get(key, (0, 0))
         h2h.append(wins / games if games > 0 else 0.5)
@@ -416,6 +428,60 @@ def add_schedule_features(df: pd.DataFrame) -> pd.DataFrame:
     if "games_in_last_10" in df.columns and "opp_games_in_last_10" in df.columns:
         # positive = opponent is more fatigued
         df["workload_advantage"] = df["opp_games_in_last_10"] - df["games_in_last_10"]
+    return df
+
+
+def add_goalie_features(df: pd.DataFrame, goalie_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute rolling goalie features from per-game starter stats and join to df.
+
+    goalie_df contains one row per (team, date) for the starting goalie
+    (highest icetime). Rolling windows are shift-1 to prevent leakage.
+
+    Features added per window (prefixed rolling_{w}_goalie_):
+      gsax          — Goals Saved Above Expected per game
+      gsax_flurry   — Flurry-adjusted GSAx
+      hd_save_pct   — High-danger save%
+    """
+    if goalie_df is None or goalie_df.empty:
+        return df
+
+    goalie_base_cols = ["gsax", "gsax_flurry", "hd_save_pct"]
+
+    parts = []
+    for (team, season), grp in goalie_df.groupby(["team", "season"]):
+        grp = grp.sort_values("date").copy()
+        new_cols = []
+        for col in goalie_base_cols:
+            if col not in grp.columns:
+                continue
+            shifted = grp[col].shift(1)
+            for w in WINDOWS:
+                feat = f"rolling_{w}_goalie_{col}"
+                grp[feat] = shifted.rolling(w, min_periods=1).mean()
+                new_cols.append(feat)
+        parts.append(grp[["team", "season", "date"] + new_cols])
+
+    if not parts:
+        return df
+
+    rolling_goalie = pd.concat(parts, ignore_index=True).sort_values(["team", "season", "date"])
+
+    merged_parts = []
+    for season, s_df in df.groupby("season"):
+        g_s = (rolling_goalie[rolling_goalie["season"] == season]
+               .sort_values("date")
+               .drop(columns=["season"]))
+        result = pd.merge_asof(
+            s_df.sort_values("date"),
+            g_s,
+            on="date",
+            by="team",
+            direction="backward",
+        )
+        merged_parts.append(result)
+
+    df = pd.concat(merged_parts).sort_values(["season", "date", "team"]).reset_index(drop=True)
     return df
 
 
@@ -585,21 +651,24 @@ def add_standings_features(df: pd.DataFrame,
 
 
 def build_features(df: pd.DataFrame,
-                   xg_df: "pd.DataFrame | None" = None) -> pd.DataFrame:
+                   xg_df: "pd.DataFrame | None" = None,
+                   goalie_df: "pd.DataFrame | None" = None) -> pd.DataFrame:
     """
     Full feature engineering pipeline.
 
-    xg_df: optional MoneyPuck game-by-game xG DataFrame from xg_loader.
-           When provided, rolling xG features are computed over ALL team games
-           (home + away) and joined before add_opponent_features so that
-           opp_rolling_*_xg* columns are created automatically.
+    xg_df:     optional MoneyPuck game-by-game xG DataFrame from xg_loader.
+    goalie_df: optional per-game starter goalie stats from goalie_loader.
+               Both are joined before add_opponent_features so opp_* columns
+               are created automatically.
     """
     df = compute_team_features(df)
     df = add_derived_features(df)
     df = add_streak_features(df)
     if xg_df is not None and not xg_df.empty:
-        df = add_xg_features(df, xg_df)   # before opponent join → opp_xg_ auto-created
-    df = add_opponent_features(df)        # opp_* schedule + xG cols created here
+        df = add_xg_features(df, xg_df)       # before opponent join → opp_xg_ auto-created
+    if goalie_df is not None and not goalie_df.empty:
+        df = add_goalie_features(df, goalie_df)  # before opponent join → opp_goalie_ auto-created
+    df = add_opponent_features(df)        # opp_* schedule + xG + goalie cols created here
     df = add_standings_features(df)       # motivation / playoff pressure features
     df = add_elo_features(df)             # cumulative power rankings across all seasons
     df = add_h2h_features(df)
@@ -610,16 +679,3 @@ def build_features(df: pd.DataFrame,
     return df
 
 
-def get_feature_cols(df: pd.DataFrame) -> list:
-    """Return all engineered feature column names (excludes raw game stats and metadata)."""
-    exclude = {
-        "game_num", "date", "team", "home_away", "opponent", "result",
-        "goals_for", "goals_against", "overtime_type",
-        "team_sog", "opp_sog", "team_pim", "opp_pim",
-        "team_ppg", "team_ppo", "team_shg", "opp_ppg", "opp_ppo", "opp_shg",
-        "faceoff_wins", "faceoff_losses", "faceoff_pct",
-        "corsi_for", "corsi_against", "corsi_pct",
-        "fenwick_for", "fenwick_against", "fenwick_pct",
-        "off_zone_start_pct", "pdo", "season",
-    }
-    return [c for c in df.columns if c not in exclude]

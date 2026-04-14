@@ -23,15 +23,14 @@ Probability estimation
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 from scipy.stats import poisson
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from xgboost import XGBClassifier, XGBRegressor
-from lightgbm import LGBMClassifier, LGBMRegressor
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 
 
 # ── spread ensemble (binary classification) ──────────────────────────────────

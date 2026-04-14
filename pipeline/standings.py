@@ -36,7 +36,6 @@ import os
 import time
 import requests
 import pandas as pd
-import numpy as np
 
 DATA_DIR      = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 STANDINGS_DIR = os.path.join(DATA_DIR, "standings")
@@ -213,8 +212,8 @@ def _motivation_score(row: pd.Series) -> float:
         return 0.15       # just eliminated, may still play hard
 
     # ── Clinched — seeding concerns only ──────────────────────────────────────
-    if clinch == "z":
-        # Division clinched — only president's trophy or seeding matters
+    if clinch in ("p", "z", "y"):
+        # Division / Presidents' Trophy clinched — only seeding matters
         return 0.30
     if clinch == "x":
         # Playoff spot clinched — seeding still has value but no urgency
@@ -271,7 +270,8 @@ def build_standings_features(standings_df: pd.DataFrame | None = None) -> pd.Dat
     df["games_remaining"] = 82 - df["games_played"]
 
     # Numeric clinch status
-    clinch_map = {"z": 2, "x": 1, "": 0, "e": -1}
+    # p = Presidents' Trophy (best record), z/y = division clinched, x = playoff spot, e = eliminated
+    clinch_map = {"p": 2, "z": 2, "y": 2, "x": 1, "": 0, "e": -1}
     df["clinch_status"] = df["clinch"].map(clinch_map).fillna(0).astype(int)
 
     df["motivation"] = df.apply(_motivation_score, axis=1)
@@ -283,7 +283,7 @@ def build_standings_features(standings_df: pd.DataFrame | None = None) -> pd.Dat
         (df["points_above_cut"] <= 0) &
         (df["games_remaining"] <= 6)
     ).astype(int)
-    df["is_clinched"]  = df["clinch"].isin(["x", "z"]).astype(int)
+    df["is_clinched"]  = df["clinch"].isin(["x", "y", "z", "p"]).astype(int)
 
     cols = ["team", "date", "season", "points", "games_played", "games_remaining",
             "conf_rank", "points_above_cut", "clinch_status", "motivation",

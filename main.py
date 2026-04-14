@@ -15,7 +15,7 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-from pipeline import data_loader, features, noise_reduction, calibration, betting, xg_loader
+from pipeline import data_loader, features, noise_reduction, calibration, xg_loader, goalie_loader
 from models import train, evaluate, secondary, totals
 from models.totals import prob_over_goals, prob_under
 
@@ -197,15 +197,23 @@ def main():
               f"{xg_data['season'].nunique()} seasons, "
               f"{xg_data['team'].nunique()} teams.")
 
+    # ── 1c. Load goalie data (optional — model runs without it if files missing) ──
+    print("Loading goalie data...")
+    goalie_data = goalie_loader.load_goalie_all_seasons()
+
     # ── 2. Feature engineering on the full dataset ───────────────────────────
     #   Rolling features use shift(1), so upcoming games (NaN result) get
     #   correct feature vectors computed from all prior played games.
     print("Engineering features...")
-    df_all_fe = features.build_features(df_all, xg_df=xg_data if not xg_data.empty else None)
+    df_all_fe = features.build_features(
+        df_all,
+        xg_df=xg_data if not xg_data.empty else None,
+        goalie_df=goalie_data if not goalie_data.empty else None,
+    )
 
     # ── 3. Noise reduction — fit on all played rows, apply everywhere ─────────
     print("Applying noise reduction...")
-    played_mask = df_all_fe["result"].notna()
+    played_mask = df_all_fe["result"].isin(["W","L"])
     df_all_fe.loc[played_mask] = noise_reduction.apply(df_all_fe[played_mask].copy())
 
     # Split
@@ -248,7 +256,7 @@ def main():
     _log_feature_importances(all_models, df_train_fe)
 
     # ── 7. Calibrate on 2025-26 played games (same distribution as predictions) ─
-    df_live = df_predict_fe[df_predict_fe["result"].notna()].copy()
+    df_live = df_predict_fe[df_predict_fe["result"].isin(["W","L"])].copy()
     y_live  = df_live["result"].eq("W").astype(int).reset_index(drop=True)
     df_live = df_live.reset_index(drop=True)
 
@@ -269,7 +277,10 @@ def main():
         cal_start = int(n_train * 0.80)
         print(f"  Calibrating on training fallback: fit from row {cal_start}")
 
-    print()
+    # Collect per-window calibration inputs for pooled fitting
+    X_cal_by_window: dict = {}
+    y_cal_fit_ref: np.ndarray | None = None
+
     for w, models in all_models.items():
         feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
 
@@ -277,19 +288,29 @@ def main():
             live_fc   = [c for c in feat_cols if c in df_live.columns]
             X_cal_fit  = df_live[live_fc].iloc[:cal_live_cut]
             y_cal_fit  = y_live.iloc[:cal_live_cut]
-            X_cal_eval = df_live[live_fc].iloc[cal_live_cut:]
-            y_cal_eval = y_live.iloc[cal_live_cut:]
         else:
             X_cal_fit  = df_train_fe[feat_cols].iloc[cal_start:]
             y_cal_fit  = y_train.iloc[cal_start:]
-            X_cal_eval = X_cal_fit
-            y_cal_eval = y_cal_fit
 
-        print(f"  N={w}  (fit on {len(X_cal_fit)} games, eval on {len(X_cal_eval)} games):")
-        calibrated[w] = {
-            name: calibration.calibrate(m, X_cal_fit, y_cal_fit, X_cal_eval, y_cal_eval)
-            for name, m in models.items()
-        }
+        X_cal_by_window[w] = (X_cal_fit, feat_cols)
+        if y_cal_fit_ref is None:
+            y_cal_fit_ref = np.asarray(y_cal_fit)
+
+    print(f"\n  Pooling calibration across {len(all_models)} windows × {len(next(iter(all_models.values())))} models")
+    print(f"  (fit slice: {len(X_cal_fit)} games per window)")
+    _, calibrated = calibration.calibrate_pooled(
+        all_models, X_cal_by_window, y_cal_fit_ref
+    )
+
+    # Surface per-window eval counts for logging
+    for w in all_models:
+        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe) if c in df_train_fe.columns]
+        if USE_LIVE_CAL:
+            live_fc    = [c for c in feat_cols if c in df_live.columns]
+            n_eval     = len(df_live[live_fc].iloc[cal_live_cut:])
+        else:
+            n_eval = len(df_train_fe[feat_cols].iloc[cal_start:])
+        print(f"  N={w}: eval={n_eval} games")
 
     # ── 8. Threshold optimisation ─────────────────────────────────────────────
     print("\nOptimising decision thresholds (F-0.5)...")
@@ -354,7 +375,7 @@ def main():
             print(f"\nNo games found on {target_date.date()} in 2025-26 data.")
             return
     else:
-        upcoming = df_predict_fe[df_predict_fe["result"].isna()].sort_values("date")
+        upcoming = df_predict_fe[~df_predict_fe["result"].isin(["W","L"])].sort_values("date")
         if upcoming.empty:
             print("\nNo upcoming games found in 2025-26 data.")
             return
@@ -380,7 +401,7 @@ def main():
                      if c in df_train_fe.columns]
     X_sec = df_train_fe[sec_feat_cols]
 
-    played_train = df_train_fe["result"].notna() & df_train_fe["overtime_type"].notna()
+    played_train = df_train_fe["result"].isin(["W","L"]) & df_train_fe["overtime_type"].notna()
     X_sec_played = X_sec[played_train]
     y_ot      = df_train_fe.loc[played_train, "overtime_type"].ne("REG").astype(int)
     y_reg_win = (df_train_fe.loc[played_train, "result"].eq("W") &
@@ -394,11 +415,14 @@ def main():
 
     # ── 8c. Train totals / spread models (multi-window, calibrated ensemble) ──
     print("\nTraining spread / totals models (4 windows × 3 models each)...")
-    played_all = (df_train_fe["result"].notna() &
+    played_all = (df_train_fe["result"].isin(["W","L"]) &
                   df_train_fe["goals_for"].notna() &
                   df_train_fe["team_sog"].notna())
     df_played = df_train_fe[played_all]
-    spread_weights = compute_sample_weights(df_played)
+    # Subset the already-computed sample_weights instead of recomputing on df_played.
+    # Both df_train_fe and sample_weights have identical ordering, so boolean indexing
+    # gives the exact same weights without re-running the season-recency computation.
+    spread_weights = sample_weights[played_all.values]
 
     y_home_spread = (df_played["goals_for"] - df_played["goals_against"] >= 2).astype(int)
     y_away_spread = (df_played["goals_against"] - df_played["goals_for"] >= 2).astype(int)
@@ -474,7 +498,7 @@ def main():
 
     # ── Pre-compute home/away records and current-season H2H ─────────────────
     # Use only played games up to (but not including) target_date so no leakage.
-    _played = df_all[df_all["result"].notna() & (df_all["date"] < str(target_date.date()))].copy()
+    _played = df_all[df_all["result"].isin(["W","L"]) & (df_all["date"] < str(target_date.date()))].copy()
     _cur_season = _played["season"].max()
     _played_cur = _played[_played["season"] == _cur_season]
 
@@ -518,6 +542,14 @@ def main():
             )
         return "  |  ".join(lines)
 
+    # ── Fetch probable starting goalies from NHL API ─────────────────────────
+    print("\nFetching probable starting goalies...")
+    probable_goalies = goalie_loader.fetch_probable_goalies(str(target_date.date()))
+    if probable_goalies:
+        print(f"  Goalie data fetched for {len(probable_goalies)} game(s).")
+    else:
+        print("  No goalie data available from NHL API.")
+
     print(f"\n{'═'*68}")
     print(f"  NHL PREDICTIONS — {target_date.date()}")
     print(f"{'═'*68}")
@@ -546,10 +578,25 @@ def main():
         n_win        = sum(1 for p in all_probs.values() if p >= 0.5)
         consensus    = f"{n_win}/{len(all_probs)} models predict WIN"
         prediction   = "WIN" if ensemble_p >= 0.5 else "LOSS"
-        # Thresholds anchored to LR walk-forward calibration (2025-26 held-out):
-        #   p ≥ 0.53 → 61% hit rate (54 games)
-        #   p ≥ 0.52 → 58% hit rate (115 games)
-        conf_flag    = "▲ HIGH" if ensemble_p > 0.55 else ("▶ MED" if ensemble_p > 0.52 else "▼ LOW")
+
+        # Confidence = probability strength × model agreement
+        # Denominators anchored to live 2025-26 calibrated probability distribution:
+        #   median edge = 0.032, p75 edge = 0.060, typical inter-window std ≈ 0.015-0.025
+        # HIGH requires: edge in top ~25% of all predictions AND models agree tightly
+        probs_list   = list(all_probs.values())
+        prob_edge    = abs(ensemble_p - 0.5)
+        prob_std     = float(np.std(probs_list))
+        # std normalizer: 0.03 = typical inter-window spread; above that = scattered
+        agreement    = max(0.0, 1.0 - prob_std / 0.03)
+        # edge normalizer: 0.06 = p75 of live edges (top quartile = genuinely strong)
+        conf_score   = 0.60 * min(prob_edge / 0.06, 1.0) + 0.40 * agreement
+
+        if conf_score >= 0.70 and prob_edge >= 0.03:
+            conf_flag = "▲ HIGH"
+        elif conf_score >= 0.40 and prob_edge >= 0.015:
+            conf_flag = "▶ MED"
+        else:
+            conf_flag = "▼ LOW"
 
         # Per-window average (cleaner breakdown than 16 rows)
         window_avgs = {}
@@ -651,25 +698,41 @@ def main():
         p_fav_m15 = p_home_spread    if home_is_fav else p_away_spread
         p_dog_p15 = 1.0 - p_fav_m15
 
-        # Spread recommendation
-        if p_fav_m15 >= 0.38:
-            spread_rec = f"{fav_team} -1.5"
-            spread_rec_p = p_fav_m15
+        # Spread recommendation: use base-rate-relative edge rather than 0.5 threshold.
+        # Home covers -1.5 ~33% of the time, away covers ~27%.
+        # We recommend -1.5 only when the model's probability meaningfully exceeds
+        # the empirical base rate; otherwise default to +1.5 (dog stays within a goal).
+        HOME_COVER_BASE = 0.33
+        AWAY_COVER_BASE = 0.27
+        COVER_EDGE_MIN  = 0.05   # model must beat base rate by at least 5 pp
+
+        home_cover_edge = p_home_spread - HOME_COVER_BASE
+        away_cover_edge = p_away_spread - AWAY_COVER_BASE
+
+        if home_cover_edge >= COVER_EDGE_MIN and home_cover_edge >= away_cover_edge:
+            spread_rec   = f"{game['team']} -1.5"
+            spread_rec_p = p_home_spread
+        elif away_cover_edge >= COVER_EDGE_MIN and away_cover_edge > home_cover_edge:
+            spread_rec   = f"{game['opponent']} -1.5"
+            spread_rec_p = p_away_spread
         else:
-            spread_rec = f"{dog_team} +1.5"
+            # Neither side has a meaningful cover edge — lean to the dog
+            spread_rec   = f"{dog_team} +1.5"
             spread_rec_p = p_dog_p15
 
-        # Total goals recommendation.
-        # Find the integer line closest to the prediction, then pick over/under.
-        # This avoids overreaching (e.g. predicting 6.1 doesn't recommend over 7 or over 8).
+        # Total goals recommendation using half-point lines (5.5, 6.5, 7.5).
+        # Half-point lines force a clean over/under — no push possible.
+        # P(over 5.5) = P(X ≥ 6), P(over 6.5) = P(X ≥ 7), P(over 7.5) = P(X ≥ 8).
+        # Pick the half-point line where the model has the strongest conviction
+        # (probability furthest from 50%), which avoids recommending lines where
+        # Ridge's conservative prediction is essentially coin-flip.
         avg_total   = 6.24  # league average this season
-        _lines      = [5, 6, 7, 8]
-        _best_line  = min(_lines, key=lambda l: abs(pred_total_goals - l))
-        # Tie-break: if exactly halfway, lean over (regression tends to underpredict totals)
-        if pred_total_goals >= _best_line:
-            total_rec = f"OVER {_best_line}"
-        else:
-            total_rec = f"UNDER {_best_line}"
+        _half_lines = [5.5, 6.5, 7.5]
+        _half_probs = {l: prob_over_goals(pred_total_goals, l) for l in _half_lines}
+        # Conviction = distance from 0.5; pick the line with highest conviction
+        _best_line  = max(_half_lines, key=lambda l: abs(_half_probs[l] - 0.5))
+        _best_p     = _half_probs[_best_line]
+        total_rec   = f"OVER {_best_line}" if _best_p >= 0.5 else f"UNDER {_best_line}"
 
         # ── Print game header ─────────────────────────────────────────────────
         print(f"\n{'═'*68}")
@@ -679,7 +742,8 @@ def main():
 
         # ── 1. WIN / LOSS PREDICTION ──────────────────────────────────────────
         print(f"\n  PREDICTION: {game['team']} {'WIN' if ensemble_p >= 0.5 else 'LOSS'}  "
-              f"| Confidence: {conf_flag}")
+              f"| Confidence: {conf_flag}  "
+              f"(edge: {prob_edge:.1%}, agreement: {agreement:.0%})")
         print(f"  Win probability: {ensemble_p:.1%} (home)  /  {p_away:.1%} (away)")
         print(f"  Model consensus: {consensus}  |  "
               f"Window breakdown: " +
@@ -710,6 +774,37 @@ def main():
         print(f"  {game['opponent']} away record : {a_rec_str}{a_mot_str}")
         print(f"  Elo gap (home − away): {elo_str}")
         print(f"  H2H this season : {h2h_str}")
+
+        # ── Probable starting goalies ─────────────────────────────────────────
+        g_info = probable_goalies.get((game["team"], game["opponent"]))
+        if g_info:
+            src_tag = "confirmed" if g_info["source"] == "confirmed" else "probable"
+            h_gname = g_info["home_name"]
+            a_gname = g_info["away_name"]
+            h_gaa   = g_info["home_gaa"]
+            a_gaa   = g_info["away_gaa"]
+            h_sv    = g_info["home_sv_pct"]
+            a_sv    = g_info["away_sv_pct"]
+            h_grec  = g_info["home_record"]
+            a_grec  = g_info["away_record"]
+            # Rolling GSAx from our goalie features (team-level recent form)
+            h_gsax  = game.get(f"rolling_{best_window}_goalie_gsax", np.nan)
+            a_gsax  = game.get(f"opp_rolling_{best_window}_goalie_gsax", np.nan)
+            h_hdsv  = game.get(f"rolling_{best_window}_goalie_hd_save_pct", np.nan)
+            a_hdsv  = game.get(f"opp_rolling_{best_window}_goalie_hd_save_pct", np.nan)
+            def _gs(v, fmt=".3f"):
+                return f"{v:{fmt}}" if not (isinstance(v, float) and np.isnan(v)) else "N/A"
+            h_sv_str   = f"SV%={_gs(h_sv, '.4f')}" if not np.isnan(h_sv) else ""
+            a_sv_str   = f"SV%={_gs(a_sv, '.4f')}" if not np.isnan(a_sv) else ""
+            h_gaa_str  = f"GAA={_gs(h_gaa)}" if not np.isnan(h_gaa) else ""
+            a_gaa_str  = f"GAA={_gs(a_gaa)}" if not np.isnan(a_gaa) else ""
+            h_gsax_str = f"  |  rolling GSAx={_gs(h_gsax, '+.3f')}  HD-SV%={_gs(h_hdsv, '.3f')}" \
+                         if not (isinstance(h_gsax, float) and np.isnan(h_gsax)) else ""
+            a_gsax_str = f"  |  rolling GSAx={_gs(a_gsax, '+.3f')}  HD-SV%={_gs(a_hdsv, '.3f')}" \
+                         if not (isinstance(a_gsax, float) and np.isnan(a_gsax)) else ""
+            print(f"\n  GOALIES ({src_tag}):")
+            print(f"    {game['team']:<4}  {h_gname:<22}  {h_gaa_str}  {h_sv_str}  {h_grec}{h_gsax_str}")
+            print(f"    {game['opponent']:<4}  {a_gname:<22}  {a_gaa_str}  {a_sv_str}  {a_grec}{a_gsax_str}")
 
         # Build win narrative anchored to the predicted winner.
         # Assign winner/loser stats so all framing supports the model's pick.
@@ -1021,8 +1116,7 @@ def main():
         print(f"  {game['opponent'] + ' +1.5':<20} {p_away_plus15:>10.1%}{'  ◄' if p_away_plus15 > p_home_plus15 else ''}")
 
         # Spread narrative anchored to the recommended side.
-        # rec_is_home_minus = True means we recommend the home team to win by 2+.
-        rec_team  = fav_team if spread_rec.endswith("-1.5") else dog_team
+        rec_team  = spread_rec.split(" ")[0]  # first token is the team name
         rec_minus = "-1.5" in spread_rec  # True = recommending a team to cover -1.5
         s_support = []
         s_counter = []
@@ -1089,30 +1183,27 @@ def main():
         print(f"  Why {spread_rec}: {spread_why}.")
 
         # ── 4. TOTAL GOALS ────────────────────────────────────────────────────
-        # Integer lines 5/6/7/8 each map to distinct Poisson CDF thresholds:
-        # P(over 5) = P(X≥6), P(over 6) = P(X≥7), P(over 7) = P(X≥8), etc.
-        p_over_5   = prob_over_goals(pred_total_goals, 5)
-        p_over_6   = prob_over_goals(pred_total_goals, 6)
-        p_over_7   = prob_over_goals(pred_total_goals, 7)
-        p_over_8   = prob_over_goals(pred_total_goals, 8)
-        p_under_5  = prob_under(p_over_5)
-        p_under_6  = prob_under(p_over_6)
-        p_under_7  = prob_under(p_over_7)
-        p_under_8  = prob_under(p_over_8)
+        # Half-point lines: P(over 5.5)=P(X≥6), P(over 6.5)=P(X≥7), P(over 7.5)=P(X≥8)
+        # Half-points force a clean over/under split (no push) and match sportsbook lines.
+        p_over_55  = prob_over_goals(pred_total_goals, 5.5)
+        p_over_65  = prob_over_goals(pred_total_goals, 6.5)
+        p_over_75  = prob_over_goals(pred_total_goals, 7.5)
+        p_under_55 = prob_under(p_over_55)
+        p_under_65 = prob_under(p_over_65)
+        p_under_75 = prob_under(p_over_75)
 
         print(f"\n  TOTAL GOALS: Model predicts {pred_total_goals:.1f} goals  |  Best bet: {total_rec}")
         print(f"  {'Line':<8} {'Over':>8} {'Under':>8}   (league avg: {avg_total:.1f})")
         print(f"  {'─'*30}")
-        for line, po, pu in [(5, p_over_5, p_under_5),
-                              (6, p_over_6, p_under_6),
-                              (7, p_over_7, p_under_7),
-                              (8, p_over_8, p_under_8)]:
-            is_rec_line = total_rec.endswith(str(line))
-            over_star  = " ★" if is_rec_line and total_rec.startswith("OVER")  else ""
-            under_star = " ★" if is_rec_line and total_rec.startswith("UNDER") else ""
+        for line, po, pu in [(5.5, p_over_55, p_under_55),
+                              (6.5, p_over_65, p_under_65),
+                              (7.5, p_over_75, p_under_75)]:
+            is_rec = str(line) in total_rec
+            over_star  = " ★" if is_rec and total_rec.startswith("OVER")  else ""
+            under_star = " ★" if is_rec and total_rec.startswith("UNDER") else ""
             over_mark  = " ◄" if po > pu else ""
             under_mark = " ◄" if pu > po else ""
-            print(f"  {line:<8d} {po:>7.1%}{over_mark+over_star:<5} {pu:>7.1%}{under_mark+under_star}")
+            print(f"  {line:<8.1f} {po:>7.1%}{(over_mark+over_star):<5} {pu:>7.1%}{under_mark+under_star}")
 
         # Narrative: state what drives the predicted total, then note where the
         # lean sits relative to each line so the reader can judge for themselves
@@ -1167,8 +1258,8 @@ def main():
             goals_reasons.append("rolling offensive and defensive metrics were used to project the total")
 
         # State exactly which lines the projection clears vs falls under
-        over_lines  = [l for l in [5, 6, 7, 8] if pred_total_goals > l]
-        under_lines = [l for l in [5, 6, 7, 8] if pred_total_goals <= l]
+        over_lines  = [l for l in [5.5, 6.5, 7.5] if pred_total_goals > l]
+        under_lines = [l for l in [5.5, 6.5, 7.5] if pred_total_goals <= l]
         lean_parts  = []
         if over_lines:
             lean_parts.append(f"over {', '.join(str(l) for l in over_lines)}")
@@ -1225,14 +1316,12 @@ def main():
             "spread_rec_p":   spread_rec_p,
             "total_pred":     pred_total_goals,
             "total_rec":      total_rec,
-            "p_over_5":       p_over_5,
-            "p_under_5":      p_under_5,
-            "p_over_6":       p_over_6,
-            "p_under_6":      p_under_6,
-            "p_over_7":       p_over_7,
-            "p_under_7":      p_under_7,
-            "p_over_8":       p_over_8,
-            "p_under_8":      p_under_8,
+            "p_over_55":      p_over_55,
+            "p_under_55":     p_under_55,
+            "p_over_65":      p_over_65,
+            "p_under_65":     p_under_65,
+            "p_over_75":      p_over_75,
+            "p_under_75":     p_under_75,
             "p_ot":           p_ot,
         })
 
@@ -1269,11 +1358,10 @@ def main():
                 print(f"     Win probability : {p_pick:.1%}")
                 print(f"     Spread lean     : {s['spread_rec']}  ({s['spread_rec_p']:.0%})")
                 print(f"     Goals lean      : {s['total_rec']}  (projected {s['total_pred']:.1f} goals)")
-                for _l, _ok, _uk in [(5,"p_over_5","p_under_5"),
-                                      (6,"p_over_6","p_under_6"),
-                                      (7,"p_over_7","p_under_7"),
-                                      (8,"p_over_8","p_under_8")]:
-                    _is_rec = s["total_rec"].endswith(str(_l))
+                for _l, _ok, _uk in [(5.5,"p_over_55","p_under_55"),
+                                      (6.5,"p_over_65","p_under_65"),
+                                      (7.5,"p_over_75","p_under_75")]:
+                    _is_rec = str(_l) in s["total_rec"]
                     _o_star = " ★" if _is_rec and s["total_rec"].startswith("OVER")  else ""
                     _u_star = " ★" if _is_rec and s["total_rec"].startswith("UNDER") else ""
                     print(f"       Line {_l} — over: {s[_ok]:.0%}{_o_star}  under: {s[_uk]:.0%}{_u_star}")

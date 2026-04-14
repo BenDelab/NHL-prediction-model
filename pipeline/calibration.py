@@ -80,6 +80,64 @@ def calibrate(model, X_cal, y_cal, X_eval=None, y_eval=None):
     return TemperatureScaler(model, T)
 
 
-def calibration_curve_data(y_true, y_prob, n_bins: int = 10):
-    from sklearn.calibration import calibration_curve
-    return calibration_curve(y_true, y_prob, n_bins=n_bins)
+def calibrate_pooled(models_by_window: dict, X_cal_by_window: dict,
+                     y_cal: np.ndarray) -> tuple[float, dict]:
+    """
+    Pool raw probabilities from ALL windows and models, fit ONE global
+    temperature T, then wrap every model with that T.
+
+    Why this beats per-window calibration on NHL data:
+    - Each window sees ~26 cal games (150 × 0.70 / 4 windows).
+      26 games = ±10 pp uncertainty on the win rate, making per-window T
+      estimates noisy.  Pooling gives ~312 observations (26 × 4 windows × 3
+      models) — enough for a stable T estimate.
+    - Temperature scaling has one degree of freedom, so there is no
+      overfitting risk from using a larger pool.
+
+    Parameters
+    ----------
+    models_by_window : {window: {name: fitted_model}}
+    X_cal_by_window  : {window: (X_cal, feature_cols)}
+        X_cal should already be the per-window slice of calibration data.
+    y_cal : 1-D array of true labels (same for every window since games are
+        the same; broadcast from the first window)
+
+    Returns
+    -------
+    T_global : float
+        The fitted temperature.
+    calibrated : {window: {name: TemperatureScaler}}
+    """
+    all_raw_probs = []
+    all_labels    = []
+
+    for w, models in models_by_window.items():
+        X_cal, feat_cols = X_cal_by_window[w]
+        for name, m in models.items():
+            raw = m.predict_proba(X_cal)[:, 1]
+            all_raw_probs.append(raw)
+            all_labels.append(np.asarray(y_cal))
+
+    raw_pool  = np.concatenate(all_raw_probs)
+    y_pool    = np.concatenate(all_labels)
+
+    T_global = _fit_temperature(raw_pool, y_pool)
+
+    from sklearn.metrics import brier_score_loss
+    raw_brier = brier_score_loss(y_pool, np.clip(raw_pool, 1e-7, 1 - 1e-7))
+    cal_pool  = expit(logit(np.clip(raw_pool, 1e-6, 1 - 1e-6)) / T_global)
+    cal_brier = brier_score_loss(y_pool, np.clip(cal_pool, 1e-7, 1 - 1e-7))
+    improvement = raw_brier - cal_brier
+    print(f"  [pooled] T={T_global:.3f} | "
+          f"Brier {raw_brier:.4f} → {cal_brier:.4f} "
+          f"({'−' if improvement >= 0 else '+'}{abs(improvement):.4f}) "
+          f"on {len(raw_pool)} pooled samples")
+
+    calibrated = {
+        w: {name: TemperatureScaler(m, T_global)
+            for name, m in models.items()}
+        for w, models in models_by_window.items()
+    }
+    return T_global, calibrated
+
+

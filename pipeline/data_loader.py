@@ -39,16 +39,5 @@ def load_all_seasons() -> pd.DataFrame:
     return df
 
 
-def load_train() -> pd.DataFrame:
-    dfs = []
-    for season in TRAIN_SEASONS:
-        path = os.path.join(DATA_DIR, SEASON_FILES[season])
-        if os.path.exists(path):
-            dfs.append(load_season(season))
-    if not dfs:
-        raise FileNotFoundError("No training season CSVs found.")
-    df = pd.concat(dfs, ignore_index=True)
-    df = df.sort_values(["season", "date", "team"]).reset_index(drop=True)
-    return df
 
 

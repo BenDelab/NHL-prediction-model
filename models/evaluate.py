@@ -63,11 +63,14 @@ def get_feature_cols_for_window(window: int, df: pd.DataFrame) -> list:
         "pp_opportunity_rate", "h2h_win_pct", "win_streak",
         "season_win_pct", "opp_season_win_pct", "opp_win_streak",
         # playoff motivation / standings pressure
+        # Continuous motivation score removed: validation showed r≈-0.03 vs residuals
+        # (no monotonic relationship). Binary flags kept — tanking +18.7% lift,
+        # must-win +4-6% lift on historical data.
         "points", "games_remaining", "conf_rank", "points_above_cut",
-        "clinch_status", "motivation",
+        "clinch_status",
         "opp_points", "opp_games_remaining", "opp_conf_rank",
-        "opp_points_above_cut", "opp_clinch_status", "opp_motivation",
-        "motivation_diff", "pts_above_cut_diff",
+        "opp_points_above_cut", "opp_clinch_status",
+        "pts_above_cut_diff",
         "is_tanking", "is_must_win", "is_clinched",
         "opp_is_tanking", "opp_is_must_win", "opp_is_clinched",
         # momentum
