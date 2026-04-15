@@ -60,7 +60,7 @@ def _parse_team_file(path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df["date"] = pd.to_datetime(df["gameDate"].astype(str), format="%Y%m%d")
-    df["team"] = df["playerTeam"].replace("ARI", "UTA")
+    df["team"] = df["playerTeam"].replace({"ARI": "UTA", "VGK": "VEG"})
 
     # Pivot situations into separate columns, one row per team+game
     pivoted_parts = []

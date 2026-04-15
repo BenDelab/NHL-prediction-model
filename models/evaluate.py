@@ -44,12 +44,58 @@ WINDOWS = [5, 10, 15, 20]
 METRIC_COLS = ["accuracy", "roc_auc", "precision", "recall", "f1", "brier", "log_loss"]
 
 
+# Rolling stats that add signal on top of Elo/standings for the moneyline model.
+# Ablation on 2024-25 season shows these are the only rolling metrics with
+# positive incremental AUC. All others (win%, goals, save%, SOG, etc.) add noise
+# because Elo already captures wins and the short-window metrics are too noisy.
+_MONEYLINE_ROLLING_STATS = [
+    # Possession / shot quality (not captured by wins or Elo)
+    "corsi_pct",
+    # Expected goals (unblocked shot quality — cleaner than raw goals)
+    "xgf_ev", "xga_ev", "xgp_ev",
+    "xgf_all", "xga_all",
+    # Goalie form (per-starter rolling — see goalie_loader)
+    "goalie_gsax", "goalie_hd_save_pct",
+    # Special teams
+    "pp_efficiency", "pk_efficiency",
+    # Relative matchup differentials
+    "win_pct_diff", "goal_diff_ewm_diff", "shot_quality_gap_diff",
+]
+
+
 def get_feature_cols_for_window(window: int, df: pd.DataFrame) -> list:
-    """Feature columns for a given rolling window N (home + opponent + static)."""
+    """
+    Curated feature columns for the moneyline model at a given rolling window.
+
+    Uses only the rolling stats proven to add incremental signal on top of
+    Elo/standings (see _MONEYLINE_ROLLING_STATS). Full rolling columns are
+    still available in the DataFrame for spread/totals models via direct access.
+    """
+    prefix   = f"rolling_{window}_"
+    opp_pref = f"opp_rolling_{window}_"
+    # Only include signal-bearing rolling columns
+    rolling = []
+    for stat in _MONEYLINE_ROLLING_STATS:
+        for pfx in [prefix, opp_pref]:
+            c = pfx + stat
+            if c in df.columns:
+                rolling.append(c)
+    static = _static_features(df)
+    return list(dict.fromkeys(rolling + static))
+
+
+def get_all_rolling_cols_for_window(window: int, df: pd.DataFrame) -> list:
+    """Full rolling columns for a window — used by spread/totals models."""
     prefix   = f"rolling_{window}_"
     opp_pref = f"opp_rolling_{window}_"
     rolling  = [c for c in df.columns if c.startswith(prefix) or c.startswith(opp_pref)]
-    static   = [
+    static   = _static_features(df)
+    return rolling + static
+
+
+def _static_features(df: pd.DataFrame) -> list:
+    """Shared static (non-rolling) feature list used by both per-window and unified selectors."""
+    candidates = [
         # schedule / fatigue — home team
         "days_since_last_game", "back_to_back", "games_in_last_10",
         "game_number_in_season",
@@ -63,9 +109,6 @@ def get_feature_cols_for_window(window: int, df: pd.DataFrame) -> list:
         "pp_opportunity_rate", "h2h_win_pct", "win_streak",
         "season_win_pct", "opp_season_win_pct", "opp_win_streak",
         # playoff motivation / standings pressure
-        # Continuous motivation score removed: validation showed r≈-0.03 vs residuals
-        # (no monotonic relationship). Binary flags kept — tanking +18.7% lift,
-        # must-win +4-6% lift on historical data.
         "points", "games_remaining", "conf_rank", "points_above_cut",
         "clinch_status",
         "opp_points", "opp_games_remaining", "opp_conf_rank",
@@ -73,17 +116,55 @@ def get_feature_cols_for_window(window: int, df: pd.DataFrame) -> list:
         "pts_above_cut_diff",
         "is_tanking", "is_must_win", "is_clinched",
         "opp_is_tanking", "opp_is_must_win", "opp_is_clinched",
-        # momentum
-        "momentum_5v20", "momentum_5v10", "momentum_10v20",
-        "momentum_5v15", "momentum_10v15",
-        "ewm_momentum_5v20", "ewm_momentum_5v10",
-        # PDO / efficiency regression-to-mean
-        "pdo_regress_5v20", "pdo_regress_5v10", "pdo_regress_10v20",
-        "shoot_regress_5v20", "shoot_regress_5v10", "shoot_regress_10v20",
-        "save_regress_5v20", "save_regress_5v10", "save_regress_10v20",
+        # momentum (2 pairs: near-term surge vs baseline, medium-term trend)
+        "momentum_5v20", "momentum_10v20",
+        # PDO / efficiency regression-to-mean (5v20 only — other pairs are derivable)
+        "pdo_regress_5v20", "shoot_regress_5v20", "save_regress_5v20",
     ]
-    static = [c for c in static if c in df.columns]
-    return rolling + static
+    return [c for c in candidates if c in df.columns]
+
+
+def get_all_feature_cols(df: pd.DataFrame) -> list:
+    """
+    Feature columns for the unified model: ALL rolling windows (5/10/15/20)
+    for both home and opponent, plus shared static features.
+    L2 regularisation (C=0.03) lets the model discover which time horizon
+    matters per feature rather than choosing a single window.
+    """
+    rolling = [c for c in df.columns
+               if c.startswith("rolling_") or c.startswith("opp_rolling_")]
+    static  = _static_features(df)
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for c in rolling + static:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
+def evaluate_unified(models_dict: dict, feat_cols: list, test_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Evaluate unified (single-model) dict on test_df.
+
+    models_dict : {model_name: fitted_model}
+    feat_cols   : feature columns to use (from get_all_feature_cols)
+    Returns a DataFrame with one row per model (window=0 placeholder).
+    """
+    y_full = test_df["result"].eq("W").astype(int)
+    fc = [c for c in feat_cols if c in test_df.columns]
+    if not fc:
+        return pd.DataFrame()
+    X = test_df[fc]
+    records = []
+    for name, model in models_dict.items():
+        try:
+            m = _metrics(model, X, y_full)
+            records.append({"model": name, "window": 0, **m})
+        except Exception as e:
+            print(f"  [eval] {name} unified failed: {e}")
+    return pd.DataFrame(records)
 
 
 def _metrics(model, X, y) -> dict:

@@ -93,14 +93,12 @@ def _fetch_standings(date_str: str) -> pd.DataFrame:
 
     # Compute points_above_cut: difference between this team's pts and the 8th-seed pts
     # Group by conference (using conf_rank ≤ 8 as proxy for "in").
-    # Split into East (WPG,WSH,TOR,TBL,CAR,OTT,FLA,NJD,MTL,BUF,BOS,DET,NYI,NYR,PHI,PIT,CBJ,NSH)
-    # and West (everything else) — easier: conf_rank determines this already.
-    east = {"BOS","BUF","CAR","CBJ","DET","FLA","MTL","NJD","NSH","NYI","NYR","OTT","PHI","PIT","TBL","TOR","WSH","MNT"}
-    west = {"ANA","CGY","CHI","COL","DAL","EDM","LAK","MIN","SEA","SJS","STL","UTA","VAN","VEG","WPG","ARI","ARI"}
-
-    # Use a simpler approach: rank all teams, 8th-place conference pts = cutoff
-    # Identify conference by checking known east teams
-    EAST_TEAMS = {"BOS","BUF","CAR","CBJ","DET","FLA","MTL","NJD","NSH","NYI","NYR","OTT","PHI","PIT","TBL","TOR","WSH"}
+    # Eastern Conference: Atlantic (BOS,BUF,DET,FLA,MTL,OTT,TBL,TOR)
+    #                   + Metropolitan (CAR,CBJ,NJD,NYI,NYR,PHI,PIT,WSH)
+    # Western Conference: Central (CHI,COL,DAL,MIN,NSH,STL,UTA,WPG)
+    #                   + Pacific  (ANA,CGY,EDM,LAK,SEA,SJS,VAN,VEG)
+    # NOTE: NSH (Nashville) is Western Conference (Central Division).
+    EAST_TEAMS = {"BOS","BUF","CAR","CBJ","DET","FLA","MTL","NJD","NYI","NYR","OTT","PHI","PIT","TBL","TOR","WSH"}
     df["conference"] = df["team"].apply(lambda t: "E" if t in EAST_TEAMS else "W")
 
     pts_above = []

@@ -39,10 +39,13 @@ _SEASON_MAP = {
 def load_goalie_all_seasons() -> pd.DataFrame:
     """
     Load all NHL_goalie_*.csv files, deduplicate to one row per (team, date)
-    using the starting goalie (max icetime, situation='all'), and return
-    a DataFrame with raw per-game goalie metrics.
+    using the starting goalie (max icetime, situation='all').
 
-    Columns returned: team, date, season, gsax, gsax_flurry, hd_save_pct
+    Columns returned:
+      team, date, season, goalie_id, gsax, gsax_flurry, hd_save_pct, icetime
+
+    goalie_id (playerId) is retained so that features.py can compute per-starter
+    rolling averages — preventing different goalies from being mixed together.
     """
     pattern = os.path.join(GOALIE_DIR, "NHL_goalie_*.csv")
     files = sorted(glob.glob(pattern))
@@ -72,7 +75,7 @@ def load_goalie_all_seasons() -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["gameDate"].astype(str), format="%Y%m%d")
 
         # Normalise team abbreviation (Arizona → Utah)
-        df["team"] = df["playerTeam"].replace("ARI", "UTA")
+        df["team"] = df["playerTeam"].replace({"ARI": "UTA", "VGK": "VEG"})
 
         # One starter per (team, game): highest icetime
         df = (
@@ -86,7 +89,12 @@ def load_goalie_all_seasons() -> pd.DataFrame:
         df["gsax_flurry"] = df["flurryAdjustedxGoals"] - df["goals"]
         df["hd_save_pct"] = 1.0 - df["highDangerGoals"] / (df["highDangerShots"] + 1e-9)
 
-        dfs.append(df[["team", "date", "season", "gsax", "gsax_flurry", "hd_save_pct"]])
+        # goalie_id for per-starter tracking; icetime retained for quality filter
+        df["goalie_id"] = df["playerId"].astype(int)
+        df["icetime"]   = df["icetime"].astype(float)
+
+        dfs.append(df[["team", "date", "season", "goalie_id", "icetime",
+                        "gsax", "gsax_flurry", "hd_save_pct"]])
 
     if not dfs:
         return pd.DataFrame()
@@ -98,8 +106,9 @@ def load_goalie_all_seasons() -> pd.DataFrame:
     )
     seasons = combined["season"].nunique()
     teams   = combined["team"].nunique()
+    n_goalies = combined["goalie_id"].nunique()
     print(f"[goalie_loader] Loaded {len(combined)} team-game rows "
-          f"({teams} teams × {seasons} seasons).")
+          f"({teams} teams × {seasons} seasons, {n_goalies} unique goalies).")
     return combined
 
 

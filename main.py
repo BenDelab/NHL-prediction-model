@@ -16,7 +16,8 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 from pipeline import data_loader, features, noise_reduction, calibration, xg_loader, goalie_loader
-from models import train, evaluate, secondary, totals
+from pipeline import player_loader
+from models import train, evaluate, secondary, totals, props
 from models.totals import prob_over_goals, prob_under
 
 
@@ -126,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--date",      type=str,   default=None,   help="Predict for date YYYY-MM-DD (default: next available)")
     p.add_argument("--team",      type=str,   default=None,   help="Single-game: team abbreviation")
     p.add_argument("--game",      type=int,   default=None,   help="Single-game: game number in season")
+    p.add_argument("--props",     action="store_true", help="Include player prop predictions (shots on goal)")
     return p
 
 
@@ -134,7 +136,7 @@ def _spread_ensemble_prob(models_by_window: dict, game_row: pd.Series,
     """Average calibrated spread probability across all windows and models."""
     probs = []
     for w, models in models_by_window.items():
-        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_ref)
+        feat_cols = [c for c in evaluate.get_all_rolling_cols_for_window(w, df_ref)
                      if c in df_ref.columns]
         X = game_row[feat_cols].to_frame().T
         for model in models.values():
@@ -150,7 +152,7 @@ def _goals_ensemble_pred(models_by_window: dict, game_row: pd.Series,
     """Average regression prediction across all windows and models."""
     preds = []
     for w, models in models_by_window.items():
-        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_ref)
+        feat_cols = [c for c in evaluate.get_all_rolling_cols_for_window(w, df_ref)
                      if c in df_ref.columns]
         X = game_row[feat_cols].to_frame().T
         for model in models.values():
@@ -201,6 +203,14 @@ def main():
     print("Loading goalie data...")
     goalie_data = goalie_loader.load_goalie_all_seasons()
 
+    # ── 1d. Load player data for prop model (optional) ───────────────────────
+    print("Loading player data for props...")
+    player_data_raw = player_loader.load_player_all_seasons()
+    if not player_data_raw.empty:
+        player_data = player_loader.build_player_rolling_features(player_data_raw)
+    else:
+        player_data = pd.DataFrame()
+
     # ── 2. Feature engineering on the full dataset ───────────────────────────
     #   Rolling features use shift(1), so upcoming games (NaN result) get
     #   correct feature vectors computed from all prior played games.
@@ -243,7 +253,7 @@ def main():
     #   Weights   → cal-eval portion only  (prevent contamination from cal-fit)
     print(f"\nTraining on {len(df_train_fe)} games across all {data_loader.TRAIN_SEASONS}")
     nan_rows = df_train_fe[[c for c in df_train_fe.columns if c.startswith("rolling_")]].isna().any(axis=1).sum()
-    print(f"  ({nan_rows} rows with NaN — handled by imputer in each pipeline)\n")
+    print(f"  ({nan_rows} rows with NaN — handled by imputer in the pipeline)\n")
 
     all_models: dict = {}
     for w in evaluate.WINDOWS:
@@ -251,9 +261,6 @@ def main():
         print(f"── Window N={w} | {len(feat_cols)} features ──────────────────────────")
         all_models[w] = train.train_all(df_train_fe[feat_cols], y_train,
                                         sample_weight=sample_weights)
-
-    # ── Log feature importances (XGB + LGBM, averaged across windows) ────────
-    _log_feature_importances(all_models, df_train_fe)
 
     # ── 7. Calibrate on 2025-26 played games (same distribution as predictions) ─
     df_live = df_predict_fe[df_predict_fe["result"].isin(["W","L"])].copy()
@@ -393,7 +400,7 @@ def main():
               f"| acc={best_row['accuracy']:.3f} | AUC={best_row['roc_auc']:.3f}")
     else:
         best_window = 20
-        best_model  = "XGBoost"
+        best_model  = "Logistic Regression"
 
     # ── 8b. Train secondary models (OT likelihood + regulation win) ───────────
     print("\nTraining secondary models (OT / regulation win)...")
@@ -436,7 +443,7 @@ def main():
     total_goals_by_window: dict = {}
 
     for w in evaluate.WINDOWS:
-        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe)
+        feat_cols = [c for c in evaluate.get_all_rolling_cols_for_window(w, df_train_fe)
                      if c in df_train_fe.columns]
         X_w = df_played[feat_cols]
         print(f"  ── Window N={w} ─────────────────────────────────────────")
@@ -468,7 +475,7 @@ def main():
         print(f"    Using training fallback for spread calibration")
 
     for w in evaluate.WINDOWS:
-        feat_cols = [c for c in evaluate.get_feature_cols_for_window(w, df_train_fe)
+        feat_cols = [c for c in evaluate.get_all_rolling_cols_for_window(w, df_train_fe)
                      if c in df_train_fe.columns]
 
         if USE_LIVE_SPREAD_CAL:
@@ -495,6 +502,15 @@ def main():
             for name, m in away_spread_by_window[w].items()
         }
         print(f"    N={w}: spread calibrated")
+
+    # ── 8d. Train player prop models ─────────────────────────────────────────
+    prop_models: dict = {}
+    if args.props and not player_data.empty:
+        print("\nTraining player prop models (SOG over/under)...")
+        train_seasons_prop = set(data_loader.TRAIN_SEASONS)
+        prop_models = props.train_prop_model(player_data, train_seasons=train_seasons_prop)
+        if prop_models:
+            props.validate_prop_models(prop_models, player_data, val_season="2024-25")
 
     # ── Pre-compute home/away records and current-season H2H ─────────────────
     # Use only played games up to (but not including) target_date so no leakage.
@@ -580,15 +596,10 @@ def main():
         prediction   = "WIN" if ensemble_p >= 0.5 else "LOSS"
 
         # Confidence = probability strength × model agreement
-        # Denominators anchored to live 2025-26 calibrated probability distribution:
-        #   median edge = 0.032, p75 edge = 0.060, typical inter-window std ≈ 0.015-0.025
-        # HIGH requires: edge in top ~25% of all predictions AND models agree tightly
         probs_list   = list(all_probs.values())
         prob_edge    = abs(ensemble_p - 0.5)
         prob_std     = float(np.std(probs_list))
-        # std normalizer: 0.03 = typical inter-window spread; above that = scattered
         agreement    = max(0.0, 1.0 - prob_std / 0.03)
-        # edge normalizer: 0.06 = p75 of live edges (top quartile = genuinely strong)
         conf_score   = 0.60 * min(prob_edge / 0.06, 1.0) + 0.40 * agreement
 
         if conf_score >= 0.70 and prob_edge >= 0.03:
@@ -689,7 +700,6 @@ def main():
         p_home_spread    = _spread_ensemble_prob(home_spread_by_window, game, df_all_fe)
         p_away_spread    = _spread_ensemble_prob(away_spread_by_window, game, df_all_fe)
         pred_total_goals = _goals_ensemble_pred(total_goals_by_window, game, df_all_fe)
-        p_away = 1.0 - ensemble_p
 
         # Spread favourite by model probability
         home_is_fav = ensemble_p >= 0.5
@@ -741,6 +751,7 @@ def main():
         print(f"{'═'*68}")
 
         # ── 1. WIN / LOSS PREDICTION ──────────────────────────────────────────
+        p_away = 1.0 - ensemble_p
         print(f"\n  PREDICTION: {game['team']} {'WIN' if ensemble_p >= 0.5 else 'LOSS'}  "
               f"| Confidence: {conf_flag}  "
               f"(edge: {prob_edge:.1%}, agreement: {agreement:.0%})")
@@ -788,10 +799,10 @@ def main():
             h_grec  = g_info["home_record"]
             a_grec  = g_info["away_record"]
             # Rolling GSAx from our goalie features (team-level recent form)
-            h_gsax  = game.get(f"rolling_{best_window}_goalie_gsax", np.nan)
-            a_gsax  = game.get(f"opp_rolling_{best_window}_goalie_gsax", np.nan)
-            h_hdsv  = game.get(f"rolling_{best_window}_goalie_hd_save_pct", np.nan)
-            a_hdsv  = game.get(f"opp_rolling_{best_window}_goalie_hd_save_pct", np.nan)
+            h_gsax  = game.get(f"rolling_{bw}_goalie_gsax", np.nan)
+            a_gsax  = game.get(f"opp_rolling_{bw}_goalie_gsax", np.nan)
+            h_hdsv  = game.get(f"rolling_{bw}_goalie_hd_save_pct", np.nan)
+            a_hdsv  = game.get(f"opp_rolling_{bw}_goalie_hd_save_pct", np.nan)
             def _gs(v, fmt=".3f"):
                 return f"{v:{fmt}}" if not (isinstance(v, float) and np.isnan(v)) else "N/A"
             h_sv_str   = f"SV%={_gs(h_sv, '.4f')}" if not np.isnan(h_sv) else ""
@@ -1302,6 +1313,21 @@ def main():
             if not as_pct and astr != "N/A":
                 astr = f"{av:.2f}"
             print(f"  {label:<28} {hstr:>10} {astr:>10}")
+
+        # ── 6. PLAYER PROPS ───────────────────────────────────────────────────
+        if prop_models and not player_data.empty:
+            game_picks = props.predict_props(
+                prop_models, player_data,
+                home_team=game["team"],
+                away_team=game["opponent"],
+            )
+            if game_picks:
+                print(f"\n  PLAYER PROPS (SOG):")
+                props.print_prop_picks(game_picks, top_n=10,
+                                       home_team=game["team"],
+                                       away_team=game["opponent"])
+            else:
+                print(f"\n  PLAYER PROPS: No picks above confidence threshold.")
 
         # Store for day summary
         game_summaries.append({

@@ -34,7 +34,6 @@ def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
     sog   = df["team_sog"].shift(1)
     osog  = df["opp_sog"].shift(1)
     cf    = df["corsi_pct"].shift(1)
-    ff    = df["fenwick_pct"].shift(1)
     fo    = df["faceoff_pct"].shift(1)
     pdo   = df["pdo"].shift(1)
     oz    = df["off_zone_start_pct"].shift(1)
@@ -52,10 +51,9 @@ def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
     def rs(s): return s.rolling(n, min_periods=2).std().fillna(0)
 
     # ── FAMILY: WIN_RATE ───────────────────────────────────────────────────────
-    # Core win-rate signals in regulation, OT/SO, and exponentially weighted.
+    # Core win-rate signals in regulation and OT/SO.
     df[f"{p}_win_pct"]     = rm(wins)
     df[f"{p}_reg_win_pct"] = rm(regw)           # regulation wins only
-    df[f"{p}_ewm_win_pct"] = wins.ewm(span=n, min_periods=1).mean()
     df[f"{p}_win_pct_std"] = rs(wins)           # consistency of winning
 
     # OT win rate: wins in OT / games that went to OT (NaN → 0.5 neutral)
@@ -113,15 +111,14 @@ def _compute_team_rolling(df: pd.DataFrame, window: int) -> pd.DataFrame:
     df[f"{p}_save_pct_std"]       = rs(save)
 
     # ── FAMILY: ADVANCED ───────────────────────────────────────────────────────
-    # Possession proxies: Corsi (all shot attempts), Fenwick (unblocked), PDO, zone starts.
+    # Possession proxies: Corsi (all shot attempts), PDO, zone starts.
+    # Fenwick removed — r=0.95 with Corsi, no independent signal.
     df[f"{p}_corsi_pct"]          = rm(cf)
-    df[f"{p}_fenwick_pct"]        = rm(ff)
     df[f"{p}_pdo"]                = rm(pdo)
     df[f"{p}_off_zone_avg"]       = rm(oz)
 
     # Std devs
     df[f"{p}_corsi_pct_std"]      = rs(cf)
-    df[f"{p}_fenwick_pct_std"]    = rs(ff)
     df[f"{p}_pdo_std"]            = rs(pdo)
     df[f"{p}_off_zone_std"]       = rs(oz)
 
@@ -260,18 +257,13 @@ def add_streak_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Short-window win% minus long-window win% — positive = trending up."""
-    for ws, wl in [(5, 20), (5, 10), (10, 20), (5, 15), (10, 15)]:
+    """Short-window win% minus long-window win% — positive = trending up.
+    Kept to 2 pairs: (5,20) captures near-term surge vs baseline;
+    (10,20) captures medium-term trend. Redundant pairs removed."""
+    for ws, wl in [(5, 20), (10, 20)]:
         cs, cl = f"rolling_{ws}_win_pct", f"rolling_{wl}_win_pct"
         if cs in df.columns and cl in df.columns:
             df[f"momentum_{ws}v{wl}"] = df[cs] - df[cl]
-
-    # EWM momentum: fast ewm minus slow ewm
-    for ws, wl in [(5, 20), (5, 10)]:
-        cs, cl = f"rolling_{ws}_ewm_win_pct", f"rolling_{wl}_ewm_win_pct"
-        if cs in df.columns and cl in df.columns:
-            df[f"ewm_momentum_{ws}v{wl}"] = df[cs] - df[cl]
-
     return df
 
 
@@ -399,18 +391,16 @@ def add_h2h_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_regression_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    PDO and efficiency regression-to-mean signals.
+    PDO and efficiency regression-to-mean signals (5-game vs 20-game baseline).
     short_window - long_window: positive = current metric inflated vs baseline → likely to regress.
-    Useful for identifying teams on unsustainable shooting/goaltending runs.
+    Kept to the (5,20) pair only — (5,10) and (10,20) are derivable combinations.
     """
-    pairs = [(5, 20), (5, 10), (10, 20)]
     stats = [("pdo", "pdo_regress"), ("shooting_pct", "shoot_regress"), ("save_pct", "save_regress")]
-    for ws, wl in pairs:
-        for raw_stat, prefix in stats:
-            sc = f"rolling_{ws}_{raw_stat}"
-            lc = f"rolling_{wl}_{raw_stat}"
-            if sc in df.columns and lc in df.columns:
-                df[f"{prefix}_{ws}v{wl}"] = df[sc] - df[lc]
+    for raw_stat, prefix in stats:
+        sc = f"rolling_5_{raw_stat}"
+        lc = f"rolling_20_{raw_stat}"
+        if sc in df.columns and lc in df.columns:
+            df[f"{prefix}_5v20"] = df[sc] - df[lc]
     return df
 
 
@@ -433,55 +423,183 @@ def add_schedule_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_goalie_features(df: pd.DataFrame, goalie_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute rolling goalie features from per-game starter stats and join to df.
+    Compute per-starter rolling goalie features and join to df.
 
-    goalie_df contains one row per (team, date) for the starting goalie
-    (highest icetime). Rolling windows are shift-1 to prevent leakage.
+    Rolls stats over the individual goalie's own starts (identified by goalie_id),
+    not over team games — this prevents mixing different starters into a single
+    rolling average which dilutes the goalie signal.
+
+    Strategy:
+      1. For each goalie, compute their rolling N-start averages (shift-1 to
+         prevent leakage) across their career in chronological order.
+      2. For each team-game in df, look up the goalie who started that game
+         via goalie_df and retrieve their per-starter rolling values.
 
     Features added per window (prefixed rolling_{w}_goalie_):
       gsax          — Goals Saved Above Expected per game
       gsax_flurry   — Flurry-adjusted GSAx
       hd_save_pct   — High-danger save%
+    Also adds:
+      goalie_starts_rolling_{w} — number of starts in this goalie's rolling window
+                                   (proxy for experience/sample reliability)
     """
     if goalie_df is None or goalie_df.empty:
         return df
 
+    if "goalie_id" not in goalie_df.columns:
+        # Legacy data without goalie_id — fall back to team-level rolling
+        _base_cols = ["gsax", "gsax_flurry", "hd_save_pct"]
+        parts = []
+        for (team, season), grp in goalie_df.groupby(["team", "season"]):
+            grp = grp.sort_values("date").copy()
+            new_cols = []
+            for col in _base_cols:
+                if col not in grp.columns:
+                    continue
+                shifted = grp[col].shift(1)
+                for w in WINDOWS:
+                    feat = f"rolling_{w}_goalie_{col}"
+                    grp[feat] = shifted.rolling(w, min_periods=1).mean()
+                    new_cols.append(feat)
+            parts.append(grp[["team", "season", "date"] + new_cols])
+        if not parts:
+            return df
+        rolling_goalie = pd.concat(parts, ignore_index=True).sort_values(["team", "season", "date"])
+        merged_parts = []
+        for season, s_df in df.groupby("season"):
+            g_s = rolling_goalie[rolling_goalie["season"] == season].sort_values("date").drop(columns=["season"])
+            result = pd.merge_asof(s_df.sort_values("date"), g_s, on="date", by="team", direction="backward")
+            merged_parts.append(result)
+        return pd.concat(merged_parts).sort_values(["season", "date", "team"]).reset_index(drop=True)
+
     goalie_base_cols = ["gsax", "gsax_flurry", "hd_save_pct"]
 
-    parts = []
+    # ── Step 1: compute per-goalie rolling stats across ALL seasons ───────────
+    # Sort each goalie's starts chronologically and roll over their own history.
+    goalie_sorted = goalie_df.sort_values(["goalie_id", "date"]).copy()
+    goalie_rolling_parts = []
+
+    for goalie_id, grp in goalie_sorted.groupby("goalie_id"):
+        grp = grp.copy()
+        new_feat_cols = []
+        for col in goalie_base_cols:
+            if col not in grp.columns:
+                continue
+            shifted = grp[col].shift(1)          # shift-1: no leakage
+            for w in WINDOWS:
+                feat = f"rolling_{w}_goalie_{col}"
+                grp[feat] = shifted.rolling(w, min_periods=1).mean()
+                new_feat_cols.append(feat)
+
+        # Count of prior starts in this window (sample reliability proxy)
+        for w in WINDOWS:
+            grp[f"goalie_starts_rolling_{w}"] = (
+                grp["gsax"].shift(1).notna().astype(float)
+                .rolling(w, min_periods=0).sum()
+            )
+            new_feat_cols.append(f"goalie_starts_rolling_{w}")
+
+        goalie_rolling_parts.append(
+            grp[["goalie_id", "team", "season", "date"] + new_feat_cols]
+        )
+
+    if not goalie_rolling_parts:
+        return df
+
+    per_goalie_rolling = (
+        pd.concat(goalie_rolling_parts, ignore_index=True)
+          .sort_values(["team", "date"])
+    )
+
+    # ── Step 2: join per-goalie rolling to game rows ──────────────────────────
+    # For each home-game row in df, find the goalie who started via goalie_df,
+    # then pull their per-starter rolling values.
+    # merge_asof backward: for each game row, the most recent start of that
+    # goalie on or before that date (= the values entering this game).
+    goalie_id_map = (
+        goalie_df[["team", "season", "date", "goalie_id"]]
+          .sort_values("date")
+          .copy()
+    )
+
+    feat_cols_to_join = [c for c in per_goalie_rolling.columns
+                         if (c.startswith("rolling_") and "goalie" in c)
+                         or c.startswith("goalie_starts_")]
+
+    # ── Step 2b: compute team-level rolling as fallback for debut/cold-start goalies ─
+    # When a goalie makes their first appearance, per-starter rolling is NaN.
+    # Fall back to shift-1 rolling over ALL starters for that team (same as the
+    # original team-level approach), so there's always a value.
+    team_fallback_parts = []
     for (team, season), grp in goalie_df.groupby(["team", "season"]):
         grp = grp.sort_values("date").copy()
-        new_cols = []
+        fb_cols = []
         for col in goalie_base_cols:
             if col not in grp.columns:
                 continue
             shifted = grp[col].shift(1)
             for w in WINDOWS:
-                feat = f"rolling_{w}_goalie_{col}"
+                feat = f"fb_{w}_goalie_{col}"
                 grp[feat] = shifted.rolling(w, min_periods=1).mean()
-                new_cols.append(feat)
-        parts.append(grp[["team", "season", "date"] + new_cols])
+                fb_cols.append(feat)
+        team_fallback_parts.append(grp[["team", "season", "date"] + fb_cols])
 
-    if not parts:
-        return df
-
-    rolling_goalie = pd.concat(parts, ignore_index=True).sort_values(["team", "season", "date"])
+    team_fallback = (
+        pd.concat(team_fallback_parts, ignore_index=True)
+          .sort_values(["team", "date"])
+    )
 
     merged_parts = []
     for season, s_df in df.groupby("season"):
-        g_s = (rolling_goalie[rolling_goalie["season"] == season]
-               .sort_values("date")
-               .drop(columns=["season"]))
-        result = pd.merge_asof(
+        # First: attach the goalie_id who started each home game this season
+        gid_season = (goalie_id_map[goalie_id_map["season"] == season]
+                      [["team", "date", "goalie_id"]]
+                      .sort_values("date"))
+
+        s_df = pd.merge_asof(
             s_df.sort_values("date"),
-            g_s,
+            gid_season,
             on="date",
             by="team",
             direction="backward",
         )
-        merged_parts.append(result)
+
+        # Second: for each (goalie_id, date), pull their per-starter rolling history
+        pgr = per_goalie_rolling.sort_values("date")
+        s_df = pd.merge_asof(
+            s_df.sort_values("date"),
+            pgr[["goalie_id", "date"] + feat_cols_to_join].sort_values("date"),
+            on="date",
+            by="goalie_id",
+            direction="backward",
+        )
+
+        # Third: join team-level fallback and fill NaN per-starter values
+        fb_s = (team_fallback[team_fallback["season"] == season]
+                .drop(columns=["season"])
+                .sort_values("date"))
+        s_df = pd.merge_asof(
+            s_df.sort_values("date"),
+            fb_s,
+            on="date",
+            by="team",
+            direction="backward",
+        )
+        for col in goalie_base_cols:
+            for w in WINDOWS:
+                feat = f"rolling_{w}_goalie_{col}"
+                fb   = f"fb_{w}_goalie_{col}"
+                if feat in s_df.columns and fb in s_df.columns:
+                    s_df[feat] = s_df[feat].fillna(s_df[fb])
+        # Drop fallback columns
+        fb_drop = [c for c in s_df.columns if c.startswith("fb_")]
+        s_df = s_df.drop(columns=fb_drop)
+
+        merged_parts.append(s_df)
 
     df = pd.concat(merged_parts).sort_values(["season", "date", "team"]).reset_index(drop=True)
+    # Drop the helper goalie_id column from the main df (it's team-level data)
+    df = df.drop(columns=["goalie_id"], errors="ignore")
     return df
 
 
@@ -554,7 +672,6 @@ def add_differential_features(df: pd.DataFrame) -> pd.DataFrame:
     diffs = {
         "win_pct":           "win_pct_diff",
         "goals_for_avg":     "gf_diff",
-        "fenwick_pct":       "fenwick_diff",
         "pdo":               "pdo_diff",
         "shooting_pct":      "shooting_diff",
         "save_pct":          "save_diff",
