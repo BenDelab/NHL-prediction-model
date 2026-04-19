@@ -3,51 +3,51 @@ Player prop model: P(player exceeds shots-on-goal line).
 
 Architecture
 ------------
-One Logistic Regression model trained per candidate SOG line (1.5 / 2.5 / 3.5 / 4.5).
-Each model predicts P(I_F_shotsOnGoal > line) for a player-game.
+XGBoost count regressor (objective='count:poisson') predicts expected SOG count μ.
 
-For each player in an upcoming game we:
-  1. Compute P(over X) for all four lines.
-  2. Find the line that falls in the "competitive zone" [0.30, 0.70] —
-     these are lines where the outcome isn't already obvious from base rates.
-  3. Among competitive lines, pick the one where |P - 0.5| is largest
-     (maximum model conviction).
-  4. Surface both OVER and UNDER as candidates so the model can recommend
-     the direction with the edge, not just OVER.
+XGBoost is used instead of NB GLM because:
+  - Tree-based models capture non-linear interactions (e.g. tired top-liner vs
+    weak goalie disproportionately inflates SOG beyond an additive log-linear model)
+  - No assumptions about feature scale or linearity
+  - Handles missing values natively (optimal split direction learned per feature)
 
-This mirrors the totals model design: instead of "choose UNDER 4.5 because
-it's 98% obvious", we find the line where the model's prediction genuinely
-diverges from the 50/50 baseline — the same philosophy as picking between
-5.5 / 6.5 / 7.5 for the game total.
+SOG is overdispersed (var/mean ≈ 1.42), so Poisson variance understates tail
+probability. We estimate the NB dispersion α via method-of-moments from training
+residuals, then apply the NB CDF analytically:
 
-Walk-forward validation (train 2021-24 → test 2024-25):
-  Competitive-zone picks, conviction ≥ 0.08:  n=22,891   hit=65.8%
-  Competitive-zone picks, conviction ≥ 0.12:  n=18,797   hit=66.9%
-  Competitive-zone picks, conviction ≥ 0.15:  n=12,815   hit=68.1%
-    (OVER subset at ≥ 0.15: 65.4%  |  UNDER subset: 68.8%)
+  P(SOG > line) = 1 − NB_CDF(floor(line), n=1/α, p=1/(1+α·μ))
+
+This gives monotonically consistent probabilities across all four lines from
+a single μ prediction: P(>1.5) ≥ P(>2.5) ≥ P(>3.5) ≥ P(>4.5) always.
+
+Line selection
+--------------
+For each player we evaluate all four candidate lines (1.5/2.5/3.5/4.5) and
+select the one in the "competitive zone" [0.30, 0.70] where |P - 0.5| is
+largest. OVER/UNDER is recommended based on which direction the model favours.
+Identical to how the totals model selects between 5.5/6.5/7.5.
 
 Features (from pipeline/player_loader.py):
-  player_roll5/10_sog_mean    — recent SOG form (primary driver)
+  player_roll5/10_sog_mean    — recent SOG form (primary μ driver)
   player_roll5/10_sog_std     — SOG consistency
   player_roll5/10_ice_mean    — icetime / role stability
-  player_roll10_xg_mean       — shot quality (xGoals)
+  player_roll10_xg_mean       — shot quality
   player_roll10_hd_mean       — high-danger shots
-  player_roll5/10_fenwick_mean— unblocked shot attempts (broadens beyond SOG)
-  player_roll10_ozone_mean    — offensive zone start rate (opportunity signal)
-  opp_roll10_soa              — opponent shots-allowed rolling avg
-                                 (key: facing DAL ~26 SOA vs CBJ ~34 SOA matters)
-  is_home                     — home / away context
+  player_roll5/10_fenwick_mean— unblocked shot attempts
+  player_roll10_ozone_mean    — offensive zone start rate
+  opp_roll10_soa              — opponent shots-allowed (team-level defensive context)
+  opp_goalie_roll10_gsax      — opponent goalie GSAx rolling mean (goalie quality)
+  opp_goalie_roll10_hd_sv     — opponent goalie HD save rate rolling mean
+  is_home                     — home/away
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+from scipy.stats import nbinom
+from sklearn.metrics import mean_absolute_error, roc_auc_score
 
 from pipeline.player_loader import (
     MIN_SOG_MEAN_FOR_PROP,
@@ -55,34 +55,97 @@ from pipeline.player_loader import (
     get_prop_feature_cols,
 )
 
-# Lines we model — half-point values so over/under is a clean split with no push
-LINES = [1.5, 2.5, 3.5, 4.5]
-
-# "Competitive zone": only consider lines where P(over) is within this range.
-# Lines outside this zone are trivially obvious (e.g. UNDER 4.5 for a 4th-liner).
+LINES           = [1.5, 2.5, 3.5, 4.5]
 COMPETITIVE_MIN = 0.30
 COMPETITIVE_MAX = 0.70
+MIN_CONVICTION  = 0.08
+MIN_RECENT_ICETIME = 600   # seconds — confirms active roster
 
-# Minimum |P - 0.5| to surface a pick
-MIN_CONVICTION = 0.08
+# XGBoost hyperparameters for count regression
+_XGB_PARAMS = dict(
+    objective        = "count:poisson",
+    n_estimators     = 400,
+    max_depth        = 4,
+    learning_rate    = 0.05,
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 10,   # prevents overfitting on rare players
+    reg_alpha        = 0.1,
+    reg_lambda       = 1.0,
+    n_jobs           = -1,
+    random_state     = 42,
+)
 
-# Minimum icetime in most recent game (confirms active roster status)
-MIN_RECENT_ICETIME = 600   # 10 minutes
+
+def _nb_p_over(mu: np.ndarray, alpha: float, line: float) -> np.ndarray:
+    """
+    P(SOG > line) from NB(μ, α) CDF.
+    NB2: n = 1/α, p = 1/(1 + α·μ)  ←→  scipy size=n, prob=p
+    Half-point line: floor(1.5)=1 → P(X ≥ 2) = 1 − CDF(1)
+    """
+    n = 1.0 / alpha
+    p = 1.0 / (1.0 + alpha * mu)
+    return 1.0 - nbinom.cdf(int(line), n, p)
 
 
-def _make_target(df: pd.DataFrame, line: float) -> pd.Series:
-    return (df["I_F_shotsOnGoal"] > line).astype(int)
+def _estimate_nb_alpha(y: np.ndarray, mu: np.ndarray) -> float:
+    """
+    Method-of-moments estimate of NB2 dispersion α.
+
+    NB2: Var[Y] = μ + α·μ²
+    Solving: α = (E[(Y-μ)²] - E[μ]) / E[μ²]
+    Clipped to [0.05, 2.0] for numerical stability.
+    """
+    resid2 = (y - mu) ** 2
+    alpha = (resid2.mean() - mu.mean()) / (mu ** 2).mean()
+    return float(np.clip(alpha, 0.05, 2.0))
+
+
+class PropModel:
+    """
+    Fitted XGBoost count regressor for player SOG prediction.
+
+    Attributes
+    ----------
+    xgb_model : fitted XGBRegressor (objective='count:poisson')
+    alpha     : NB2 dispersion parameter (method-of-moments from training residuals)
+    feat_cols : list of feature column names used during training
+    """
+
+    def __init__(self, xgb_model, alpha: float, feat_cols: list[str]):
+        self.xgb_model = xgb_model
+        self.alpha     = alpha
+        self.feat_cols = feat_cols
+
+    def predict_mu(self, X: pd.DataFrame) -> np.ndarray:
+        """Predicted expected SOG count μ for each row."""
+        fc  = [c for c in self.feat_cols if c in X.columns]
+        arr = X[fc].values.astype(float)
+        return self.xgb_model.predict(arr)
+
+    def p_over(self, X: pd.DataFrame, line: float) -> np.ndarray:
+        """P(SOG > line) for each row."""
+        return _nb_p_over(self.predict_mu(X), self.alpha, line)
+
+    def p_over_all_lines(self, X: pd.DataFrame) -> dict[float, np.ndarray]:
+        """P(SOG > line) for all candidate lines from a single μ prediction."""
+        mu = self.predict_mu(X)
+        return {line: _nb_p_over(mu, self.alpha, line) for line in LINES}
 
 
 def train_prop_model(player_df: pd.DataFrame,
-                     train_seasons: set | None = None) -> dict:
+                     train_seasons: set | None = None) -> PropModel | None:
     """
-    Train one Logistic Regression per SOG line.
+    Fit an XGBoost Poisson count regressor on training data.
 
-    Returns
-    -------
-    dict: {line: fitted Pipeline}
-      e.g. {1.5: pipe_15, 2.5: pipe_25, 3.5: pipe_35, 4.5: pipe_45}
+    XGBoost handles missing values natively — no imputation applied, which
+    allows it to learn optimal split directions for sparse features (e.g. early
+    season before rolling windows are populated).
+
+    Dispersion α is estimated post-fit via method-of-moments on training
+    residuals, then used with the NB CDF for all probability queries.
+
+    Returns a PropModel, or None if training fails.
     """
     if train_seasons is None:
         all_seasons = sorted(player_df["season"].unique())
@@ -92,62 +155,78 @@ def train_prop_model(player_df: pd.DataFrame,
     feat_cols = get_prop_feature_cols(train_df)
 
     if not feat_cols:
-        print("[props] No feature columns found — prop model disabled.")
-        return {}
+        print("[props] No feature columns — prop model disabled.")
+        return None
 
-    valid_mask = train_df[feat_cols].notna().all(axis=1)
-    X_train    = train_df.loc[valid_mask, feat_cols]
+    # Keep rows with at least the core rolling SOG features; NaN in goalie/context
+    # features is fine — XGBoost handles them natively.
+    core_cols  = [c for c in feat_cols if "sog_mean" in c or "ice_mean" in c]
+    valid_mask = train_df[core_cols].notna().any(axis=1)
+    X_df       = train_df.loc[valid_mask, feat_cols]
+    y_train    = train_df.loc[valid_mask, "I_F_shotsOnGoal"].values.astype(float)
 
-    models = {}
-    for line in LINES:
-        y_train = _make_target(train_df, line)[valid_mask]
-        base    = y_train.mean()
+    if len(X_df) < 100:
+        print("[props] Insufficient training rows.")
+        return None
 
-        pipe = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler",  StandardScaler()),
-            ("model",   LogisticRegression(C=0.1, max_iter=1000,
-                                            solver="lbfgs", random_state=42)),
-        ])
-        pipe.fit(X_train, y_train)
-        models[line] = pipe
-        print(f"  [props] Trained over-{line} model | "
-              f"{len(X_train)} rows | base rate {base:.1%}")
+    X_arr = X_df.values.astype(float)
 
-    return models
+    model = xgb.XGBRegressor(**_XGB_PARAMS)
+    model.fit(X_arr, y_train, verbose=False)
+
+    mu_train = model.predict(X_arr)
+    mae      = mean_absolute_error(y_train, mu_train)
+    alpha    = _estimate_nb_alpha(y_train, mu_train)
+
+    var_mean = y_train.var() / y_train.mean()
+    print(f"  [props] XGB Poisson trained | {len(X_df):,} rows | "
+          f"MAE={mae:.3f} | α={alpha:.3f} | var/mean={var_mean:.3f}")
+    print(f"  [props] Mean μ={mu_train.mean():.3f}  actual={y_train.mean():.3f}  "
+          f"Features: {len(feat_cols)}")
+
+    # Print top feature importances
+    imp = model.feature_importances_
+    top = sorted(zip(feat_cols, imp), key=lambda x: -x[1])[:5]
+    print(f"  [props] Top features: " +
+          ", ".join(f"{n}({v:.3f})" for n, v in top))
+
+    return PropModel(model, alpha, feat_cols)
 
 
-def validate_prop_models(models: dict, player_df: pd.DataFrame,
-                          val_season: str = "2024-25") -> None:
-    """Print walk-forward validation metrics for the competitive-zone approach."""
+def validate_prop_model(model: PropModel, player_df: pd.DataFrame,
+                         val_season: str = "2024-25") -> None:
+    """Print walk-forward validation: AUC per line + competitive-zone hit rates."""
     val_df = player_df[player_df["season"] == val_season].copy()
     if val_df.empty:
-        print(f"  [props] No data for validation season {val_season}.")
+        print(f"  [props] No data for {val_season}.")
         return
 
-    feat_cols  = get_prop_feature_cols(val_df)
-    valid_mask = val_df[feat_cols].notna().all(axis=1)
-    val_valid  = val_df[valid_mask].copy()
-    X_val      = val_valid[feat_cols]
+    feat_cols = get_prop_feature_cols(val_df)
+    core_cols = [c for c in feat_cols if "sog_mean" in c or "ice_mean" in c]
+    valid_mask = val_df[core_cols].notna().any(axis=1)
+    val_valid  = val_df[valid_mask].copy().reset_index(drop=True)
 
-    # Compute all line probabilities
-    for line in LINES:
-        if line not in models:
-            continue
-        val_valid[f"p_over_{line}"] = models[line].predict_proba(X_val)[:, 1]
-
-    # Dynamic line selection
-    picks = val_valid.apply(_select_best_line, axis=1)
-    val_valid = pd.concat([val_valid, picks], axis=1)
-    has_pick = val_valid["best_line"].notna()
-
-    correct = val_valid[has_pick].apply(lambda r: (
-        (r["I_F_shotsOnGoal"] > r["best_line"]  and r["direction"] == "OVER") or
-        (r["I_F_shotsOnGoal"] <= r["best_line"] and r["direction"] == "UNDER")
-    ), axis=1)
+    mu_pred = model.predict_mu(val_valid[feat_cols])
+    mae     = mean_absolute_error(val_valid["I_F_shotsOnGoal"], mu_pred)
 
     print(f"\nProp model walk-forward ({val_season}, {valid_mask.sum()} valid rows):")
-    print(f"  Players with a competitive line: {has_pick.sum()} ({has_pick.mean():.1%})")
+    print(f"  XGB Poisson — MAE={mae:.3f}  α={model.alpha:.3f}")
+
+    all_probs = model.p_over_all_lines(val_valid[feat_cols])
+    print("  Per-line AUC:")
+    for line in LINES:
+        y_bin = (val_valid["I_F_shotsOnGoal"] > line).astype(int)
+        auc   = roc_auc_score(y_bin, all_probs[line])
+        print(f"    Over {line}: AUC={auc:.3f}  base={y_bin.mean():.3f}")
+
+    for line in LINES:
+        val_valid[f"p_over_{line}"] = all_probs[line]
+    picks_meta = val_valid.apply(_select_best_line, axis=1)
+    val_valid  = pd.concat([val_valid, picks_meta], axis=1)
+    has_pick   = val_valid["best_line"].notna()
+
+    print(f"\n  Competitive-zone picks: {has_pick.sum()} ({has_pick.mean():.1%})  "
+          f"[break-even at -110: 52.4%]")
     for min_conv in [0.08, 0.10, 0.12, 0.15]:
         sub = val_valid[has_pick & (val_valid["conviction"] >= min_conv)]
         if len(sub) < 20:
@@ -162,27 +241,16 @@ def validate_prop_models(models: dict, player_df: pd.DataFrame,
                 if len(over_sub) > 0 else float("nan")
         u_hit = (under_sub["I_F_shotsOnGoal"] <= under_sub["best_line"]).mean() \
                 if len(under_sub) > 0 else float("nan")
+        pnl = c.sum() * (100/110) * 10 - (len(sub) - c.sum()) * 10
+        roi = pnl / (len(sub) * 10) * 100
         print(f"  conviction≥{min_conv:.2f}: n={len(sub):5d}  hit={c.mean():.3f}  "
+              f"ROI={roi:+.1f}%  "
               f"over({len(over_sub)})={o_hit:.3f}  under({len(under_sub)})={u_hit:.3f}")
     print()
 
-    # Per-line AUC summary
-    print("  Per-line AUC:")
-    for line, model in models.items():
-        y = _make_target(val_valid, line)
-        p = model.predict_proba(X_val)[:, 1]
-        auc  = roc_auc_score(y, p)
-        base = y.mean()
-        print(f"    Over {line}: AUC={auc:.3f}  base={base:.3f}")
-
 
 def _select_best_line(row: pd.Series) -> pd.Series:
-    """
-    For one player-game row (with p_over_{line} columns already computed),
-    pick the line in the competitive zone with the highest model conviction.
-
-    Returns: best_line, best_p, conviction, direction
-    """
+    """Pick the competitive-zone line with highest conviction for one player-game."""
     best_line, best_conviction, best_p = None, 0.0, 0.5
     for line in LINES:
         col = f"p_over_{line}"
@@ -191,37 +259,30 @@ def _select_best_line(row: pd.Series) -> pd.Series:
         p = float(row[col])
         if not (COMPETITIVE_MIN <= p <= COMPETITIVE_MAX):
             continue
-        conviction = abs(p - 0.5)
-        if conviction > best_conviction:
-            best_conviction = conviction
+        conv = abs(p - 0.5)
+        if conv > best_conviction:
+            best_conviction = conv
             best_line = line
-            best_p = p
+            best_p    = p
 
     if best_line is None:
         return pd.Series({"best_line": None, "best_p": 0.5,
                           "conviction": 0.0, "direction": None})
+    return pd.Series({
+        "best_line":  best_line,
+        "best_p":     best_p,
+        "conviction": best_conviction,
+        "direction":  "OVER" if best_p >= 0.5 else "UNDER",
+    })
 
-    direction = "OVER" if best_p >= 0.5 else "UNDER"
-    return pd.Series({"best_line": best_line, "best_p": best_p,
-                      "conviction": best_conviction, "direction": direction})
 
-
-def predict_props(models: dict,
+def predict_props(model: PropModel,
                   player_df: pd.DataFrame,
                   home_team: str,
                   away_team: str,
                   min_conviction: float = MIN_CONVICTION) -> list[dict]:
-    """
-    Generate prop picks for all active players in home_team and away_team.
-
-    For each player:
-      - Compute P(over X) for all four lines using tonight's opponent context
-      - Find the line in the competitive zone [0.30, 0.70] with max |P-0.5|
-      - Surface as OVER or UNDER depending on which direction has the edge
-
-    Returns a list of dicts sorted by conviction descending.
-    """
-    if not models:
+    """Generate prop picks for active players in tonight's matchup."""
+    if model is None:
         return []
 
     feat_cols = get_prop_feature_cols(player_df)
@@ -230,58 +291,47 @@ def predict_props(models: dict,
 
     picks = []
     for team, is_home_flag, opp in [(home_team, 1, away_team), (away_team, 0, home_team)]:
-        # Get roster with tonight's opponent context injected
-        roster = get_current_player_stats(player_df, team,
-                                           opp_team=opp)
+        roster = get_current_player_stats(player_df, team, opp_team=opp)
         if roster.empty:
             continue
-
-        # Only active players with enough recent icetime
         roster = roster[roster["icetime"] >= MIN_RECENT_ICETIME].copy()
-        # Only players whose rolling SOG average clears the minimum threshold
         sog_col = "player_roll10_sog_mean"
         if sog_col in roster.columns:
             roster = roster[roster[sog_col] >= MIN_SOG_MEAN_FOR_PROP].copy()
         if roster.empty:
             continue
 
-        fc_present = [c for c in feat_cols if c in roster.columns]
-        if not fc_present:
+        fc = [c for c in feat_cols if c in roster.columns]
+        if not fc:
             continue
 
-        X = roster[fc_present].copy()
-        X["is_home"] = is_home_flag   # override with tonight's home/away
+        X = roster[fc].copy()
+        X["is_home"] = is_home_flag
 
-        valid_mask = X.notna().all(axis=1)
+        # Require core SOG features; goalie/context NaN is fine for XGBoost
+        core = [c for c in fc if "sog_mean" in c]
+        valid_mask = X[core].notna().any(axis=1) if core else pd.Series(True, index=X.index)
         if valid_mask.sum() == 0:
             continue
 
         X_valid    = X[valid_mask]
         valid_rows = roster[valid_mask].reset_index(drop=True)
 
-        # Compute P(over X) for all lines
-        for line, model in models.items():
-            valid_rows[f"p_over_{line}"] = model.predict_proba(X_valid)[:, 1]
+        all_probs = model.p_over_all_lines(X_valid)
+        for line in LINES:
+            valid_rows[f"p_over_{line}"] = all_probs[line]
 
-        # Select best line per player
         line_picks = valid_rows.apply(_select_best_line, axis=1)
         valid_rows = pd.concat([valid_rows, line_picks], axis=1)
 
         for _, row in valid_rows.iterrows():
-            if row["best_line"] is None:
+            if row["best_line"] is None or float(row["conviction"]) < min_conviction:
                 continue
-            if float(row["conviction"]) < min_conviction:
-                continue
-
-            # Build per-line probability table for display
             line_probs = {
-                line: {
-                    "p_over":  round(float(row.get(f"p_over_{line}", 0.5)), 3),
-                    "p_under": round(1 - float(row.get(f"p_over_{line}", 0.5)), 3),
-                }
+                line: {"p_over":  round(float(row.get(f"p_over_{line}", 0.5)), 3),
+                       "p_under": round(1 - float(row.get(f"p_over_{line}", 0.5)), 3)}
                 for line in LINES if f"p_over_{line}" in row.index
             }
-
             picks.append({
                 "name":        row.get("name", "Unknown"),
                 "team":        team,
@@ -295,6 +345,8 @@ def predict_props(models: dict,
                 "icetime_min": round(float(row.get("player_roll10_ice_mean", 0)) / 60, 1),
                 "opp_soa":     round(float(row.get("opp_roll10_soa", np.nan)), 1)
                                if not pd.isna(row.get("opp_roll10_soa")) else None,
+                "opp_gsax":    round(float(row.get("opp_goalie_roll10_gsax", np.nan)), 2)
+                               if not pd.isna(row.get("opp_goalie_roll10_gsax")) else None,
                 "is_home":     bool(is_home_flag),
                 "line_probs":  line_probs,
             })
@@ -305,12 +357,7 @@ def predict_props(models: dict,
 
 def print_prop_picks(picks: list[dict], top_n: int = 15,
                      home_team: str = "", away_team: str = "") -> None:
-    """
-    Print a formatted prop picks table.
-
-    For each player shows the recommended line/direction and the full
-    probability table across all four lines — same style as the totals table.
-    """
+    """Print formatted prop picks with per-line probability breakdown."""
     if not picks:
         print("  No prop picks above conviction threshold.")
         return
@@ -321,7 +368,7 @@ def print_prop_picks(picks: list[dict], top_n: int = 15,
 
     header = (f"  {'Player':<22} {'Pos':<4} {'Team':<5} "
               f"{'Rec':<12} {'P(rec)':<8} "
-              f"{'Roll10':<7} {'Roll5':<6} {'Ice':<6} {'OppSOA':<8} {'H/A'}")
+              f"{'Roll10':<7} {'Roll5':<6} {'Ice':<6} {'OppSOA':<7} {'GSAx':<6} {'H/A'}")
     print(header)
     print("  " + "─" * (len(header) - 2))
 
@@ -329,28 +376,24 @@ def print_prop_picks(picks: list[dict], top_n: int = 15,
     for p in picks:
         if shown >= top_n:
             break
-        ha       = "H" if p["is_home"] else "A"
-        r10      = f"{p['roll10_sog']:.1f}"
-        r5       = f"{p['roll5_sog']:.1f}"
-        ice      = f"{p['icetime_min']:.0f}m"
-        opp_soa  = f"{p['opp_soa']:.0f}" if p["opp_soa"] is not None else "N/A"
-        rec      = f"{p['direction']} {p['best_line']:.1f}"
-        prob_str = f"{p['probability']:.3f}"
-        conv_str = f"({p['conviction']:.2f})"
+        ha      = "H" if p["is_home"] else "A"
+        opp_soa = f"{p['opp_soa']:.0f}"  if p["opp_soa"]  is not None else "N/A"
+        gsax    = f"{p['opp_gsax']:+.2f}" if p["opp_gsax"] is not None else "N/A"
+        rec     = f"{p['direction']} {p['best_line']:.1f}"
 
         print(f"  {p['name']:<22} {p['position']:<4} {p['team']:<5} "
-              f"{rec:<12} {prob_str:<8} "
-              f"{r10:<7} {r5:<6} {ice:<6} {opp_soa:<8} {ha}")
+              f"{rec:<12} {p['probability']:<8.3f} "
+              f"{p['roll10_sog']:<7.1f} {p['roll5_sog']:<6.1f} "
+              f"{p['icetime_min']:<6.0f}m {opp_soa:<7} {gsax:<6} {ha}")
 
-        # Per-line probability breakdown (like totals table)
         lp = p.get("line_probs", {})
         if lp:
             parts = []
             for line in sorted(lp.keys()):
-                po = lp[line]["p_over"]
-                pu = lp[line]["p_under"]
-                best_marker = " ★" if line == p["best_line"] else "  "
-                parts.append(f"o{line:.1f}:{po:.0%}/u:{pu:.0%}{best_marker}")
-            print(f"    {conv_str}  " + "   ".join(parts))
+                po   = lp[line]["p_over"]
+                pu   = lp[line]["p_under"]
+                star = " ★" if line == p["best_line"] else "  "
+                parts.append(f"o{line:.1f}:{po:.0%}/u:{pu:.0%}{star}")
+            print(f"    ({p['conviction']:.2f})  " + "   ".join(parts))
 
         shown += 1

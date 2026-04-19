@@ -504,13 +504,13 @@ def main():
         print(f"    N={w}: spread calibrated")
 
     # ── 8d. Train player prop models ─────────────────────────────────────────
-    prop_models: dict = {}
+    prop_model = None
     if args.props and not player_data.empty:
-        print("\nTraining player prop models (SOG over/under)...")
+        print("\nTraining player prop model (Poisson GLM + NB distribution)...")
         train_seasons_prop = set(data_loader.TRAIN_SEASONS)
-        prop_models = props.train_prop_model(player_data, train_seasons=train_seasons_prop)
-        if prop_models:
-            props.validate_prop_models(prop_models, player_data, val_season="2024-25")
+        prop_model = props.train_prop_model(player_data, train_seasons=train_seasons_prop)
+        if prop_model is not None:
+            props.validate_prop_model(prop_model, player_data, val_season="2024-25")
 
     # ── Pre-compute home/away records and current-season H2H ─────────────────
     # Use only played games up to (but not including) target_date so no leakage.
@@ -1315,9 +1315,9 @@ def main():
             print(f"  {label:<28} {hstr:>10} {astr:>10}")
 
         # ── 6. PLAYER PROPS ───────────────────────────────────────────────────
-        if prop_models and not player_data.empty:
+        if prop_model is not None and not player_data.empty:
             game_picks = props.predict_props(
-                prop_models, player_data,
+                prop_model, player_data,
                 home_team=game["team"],
                 away_team=game["opponent"],
             )

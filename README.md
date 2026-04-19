@@ -1,256 +1,161 @@
-# NHL Home Game Outcome Predictor
+# NHL Prediction System
 
-A machine learning pipeline that predicts whether the **home team will win or lose** an NHL game, using rolling team performance statistics and a sliding-window validation strategy.
+A full-stack NHL prediction pipeline covering **moneyline outcomes**, **game totals (over/under goals)**, and **player shot-on-goal props**. The system is built for practical edge identification against sportsbook lines — not academic accuracy metrics.
 
-The goal is practical: given what we know about both teams heading into a game, can we predict the outcome well enough to identify when a prediction is confident and correct?
-
----
-
-## Data
-
-### Source Files
-
-Four cleaned CSV files, one per season, all sharing the same schema:
-
-| File | Seasons | Role |
-|------|---------|------|
-| `NHL_2021-22_cleaned.csv` | 2021-22 | Training |
-| `NHL_2022-23_cleaned.csv` | 2022-23 | Training |
-| `NHL_2023-24_cleaned.csv` | 2023-24 | Training |
-| `NHL_2024-25_cleaned.csv` | 2024-25 | Validation / Test |
-
-Each row represents a **single home game** for one team. Every row contains that game's stats from the home team's perspective.
-
-### Raw Columns (30 total)
-
-| Column | Description |
-|--------|-------------|
-| `game_num` | Team's game number in the season (1–82) |
-| `date` | Game date (YYYY-MM-DD) |
-| `team` | Home team abbreviation (e.g., TOR, VEG) |
-| `home_away` | Always "home" in this dataset |
-| `opponent` | Away team abbreviation |
-| `result` | **Target variable** — W (win) or L (loss) |
-| `goals_for` / `goals_against` | Goals scored by home / away team |
-| `overtime_type` | REG, OT, or SO |
-| `team_sog` / `opp_sog` | Shots on goal |
-| `team_pim` / `opp_pim` | Penalty minutes |
-| `team_ppg` / `team_ppo` | Power play goals / opportunities |
-| `team_shg` | Short-handed goals |
-| `opp_ppg` / `opp_ppo` / `opp_shg` | Opponent's PP/SH stats |
-| `faceoff_wins` / `faceoff_losses` / `faceoff_pct` | Faceoff stats |
-| `corsi_for` / `corsi_against` / `corsi_pct` | Corsi (shot attempt) metrics |
-| `fenwick_for` / `fenwick_against` / `fenwick_pct` | Fenwick (unblocked shot attempts) |
-| `off_zone_start_pct` | Offensive zone faceoff start percentage |
-| `pdo` | PDO (shooting% + save%) — a luck/regression indicator |
-
-### Baseline
-
-Home team win rate is ~53.7%, so a "always predict home win" baseline gives ~54% accuracy. The model must beat this convincingly.
+Realistic performance ceiling: ~55–58% on moneylines (same range as Vegas models), 65–68% hit rate on player props at conviction ≥ 0.12.
 
 ---
 
-## Project Structure
+## What It Does
+
+### 1. Moneyline Prediction
+Predicts whether the home team wins each NHL game. Uses an ensemble of XGBoost, LightGBM, and Logistic Regression models trained on rolling team performance features. Outputs calibrated win probabilities to compare against implied market odds and identify positive-EV bets.
+
+### 2. Totals (Over/Under Goals)
+Predicts the combined goal total for each game using a Poisson-based approach with xGoals data. Evaluates lines at 5.5, 6.5, and 7.5 goals — selecting the line in the most contested probability range rather than always picking the same line.
+
+### 3. Player Props (Shots on Goal)
+Predicts each skater's expected shots on goal using an **XGBoost count regressor** (`objective='count:poisson'`). Converts predicted μ to over/under probabilities via a **Negative Binomial CDF** (handles the overdispersion SOG data exhibits — var/mean ≈ 1.42). Evaluates lines at 1.5 / 2.5 / 3.5 / 4.5 SOG, selecting the competitive-zone line where the model has the most edge.
+
+---
+
+## Architecture
 
 ```
-nhl-predictor/
+scrape/
 │
-├── data/
-│   ├── NHL_2021-22_cleaned.csv
-│   ├── NHL_2022-23_cleaned.csv
-│   ├── NHL_2023-24_cleaned.csv
-│   └── NHL_2024-25_cleaned.csv
-│
-├── notebooks/
-│   ├── 01_eda.ipynb                  # Exploration & understanding
-│   ├── 02_feature_engineering.ipynb  # Build all features
-│   ├── 03_model_training.ipynb       # Train & compare models
-│   └── 04_evaluation.ipynb           # Sliding window validation
+├── data/                          # Cleaned season CSVs (2021-22 → 2025-26)
+├── xG/                            # Per-team xGoals CSVs by season
+├── player_stats/                  # Per-player game logs (MoneyPuck)
+├── goalie_stats/                  # Per-goalie game logs (MoneyPuck)
 │
 ├── pipeline/
-│   ├── __init__.py
-│   ├── data_loader.py                # Load & concatenate season CSVs
-│   ├── features.py                   # Feature engineering functions
-│   ├── noise_reduction.py            # Smoothing & noise filtering
-│   └── calibration.py                # Probability calibration
+│   ├── data_loader.py             # Load & merge season CSVs
+│   ├── features.py                # Rolling team features (win%, GF/GA, Corsi, Fenwick…)
+│   ├── noise_reduction.py         # PDO regression flags, winsorization
+│   ├── calibration.py             # Platt/isotonic calibration of ensemble probabilities
+│   ├── xg_loader.py               # Load xGoals data per team
+│   ├── goalie_loader.py           # Load goalie stats for team-level save quality
+│   ├── player_loader.py           # Load skater game logs + rolling features + goalie context
+│   ├── standings.py               # NHL standings scraper → playoff motivation features
+│   └── betting.py                 # Edge calculation, de-juicing, Kelly sizing
 │
 ├── models/
-│   ├── __init__.py
-│   ├── train.py                      # Model training logic
-│   └── evaluate.py                   # Evaluation & sliding window
+│   ├── train.py                   # Moneyline ensemble training (XGB + LGBM + LR)
+│   ├── evaluate.py                # Sliding-window validation, feature column logic
+│   ├── secondary.py               # Secondary model layer (temporal stacking)
+│   ├── totals.py                  # Poisson GLM for total goals, line selection
+│   └── props.py                   # XGBoost count regressor + NB CDF for SOG props
 │
-├── main.py                           # End-to-end: load → predict → summarize
-├── requirements.txt
-└── README.md
+├── main.py                        # End-to-end: train → validate → predict tonight's games
+├── backtest.py                    # Walk-forward backtest with ROI simulation
+└── requirements.txt
 ```
-
-### Design Philosophy
-
-Each notebook is a **development workspace** — explore, iterate, visualize. Once logic is solid, the clean version of each function lives in `pipeline/` or `models/`. `main.py` imports from those modules and runs the full pipeline end-to-end with no notebook dependency.
 
 ---
 
-## Pipeline Detail
+## Models in Detail
 
-### Phase 1 — EDA (`01_eda.ipynb`)
+### Moneyline — Ensemble Classifier
 
-Understand the data before touching it.
+**Features** (rolling windows of 5 / 10 / 15 / 20 games, computed per team with no leakage):
+- Win %, goals for/against, shot differentials (Corsi, Fenwick, SOG)
+- Power play / penalty kill efficiency, faceoff rate
+- PDO (shooting% + save% — a mean-reversion indicator)
+- xGoals for/against (from MoneyPuck)
+- Goalie rolling save quality (GSAx, HD-SV%)
+- Opponent rolling stats (both sides of every matchup)
+- Playoff motivation score (from standings — clinch status, points above cut, games remaining)
+- Rest days, season game number, home/away
 
-- Distribution of each feature (histograms, box plots)
-- Win/loss distributions: are certain stats strongly correlated with wins?
-- Per-team trends across the season (do teams improve/decline?)
-- Correlation matrix across all numeric features
-- Check for missing values, outliers, and data quality issues
-- PDO distribution (high PDO = lucky, expect regression — this is important context)
+**Training:** Seasons 2021-22 → 2024-25 with recency weighting (newer seasons weighted up to 2×). Early-season games ramped from 0 → 1 weight over first 15 games.
 
-### Phase 2 — Feature Engineering (`02_feature_engineering.ipynb` → `pipeline/features.py`)
+**Ensemble:** XGBoost + LightGBM + Logistic Regression per rolling window; secondary stacking layer combines window-model pairs. Calibration via isotonic regression.
 
-The raw data gives us single-game snapshots. The model needs **rolling context** — what has this team been doing recently? Features are computed per-team using only past games (no data leakage).
+**Backtest results (walk-forward, held-out seasons):**
+- Overall accuracy: 55–58%
+- High-confidence bets (calibrated p ≥ 0.55, edge ≥ 0.06): 63–67% hit rate
+- Half-Kelly staking on high-confidence picks produces positive ROI at realistic moneyline odds
 
-**Rolling Window Features (computed for each of N = 5, 10, 15, 20 recent games):**
+### Totals — Poisson GLM
 
-- `rolling_win_pct` — win percentage over last N games
-- `rolling_goals_for_avg` / `rolling_goals_against_avg` — scoring trends
-- `rolling_sog_avg` / `rolling_opp_sog_avg` — shot volume trends
-- `rolling_corsi_pct` / `rolling_fenwick_pct` — possession quality
-- `rolling_pp_efficiency` — power play goals / opportunities over N games
-- `rolling_pk_efficiency` — 1 - (opp power play goals / opp opportunities)
-- `rolling_faceoff_pct` — faceoff win rate
-- `rolling_pdo` — PDO trend (luck indicator: values far from 100 tend to regress)
+Predicts combined goals per game using a log-linear Poisson regression on team-level xGoals, defensive quality, and pace features. Evaluates P(over 5.5), P(over 6.5), P(over 7.5) and selects the line where the model has the most edge away from 50/50.
 
-**Derived Features:**
+### Player Props — XGBoost + Negative Binomial CDF
 
-- `goal_diff_rolling` — rolling goal differential (goals for - goals against)
-- `shot_diff_rolling` — rolling shot differential
-- `pp_opportunity_rate` — how often the team gets PP chances (discipline proxy)
-- `days_since_last_game` — rest advantage (computed from date column)
-- `game_number_in_season` — proxy for fatigue / sample size at that point in the year
+**Why XGBoost over Negative Binomial GLM:**
+NB GLM is log-linear — it can't capture interactions like "high-fenwick forward vs weak goalie → disproportionately more SOG." XGBoost learns these non-linear combinations directly.
 
-**Opponent Features:**
+**Why NB CDF over Poisson CDF:**
+SOG is overdispersed (var/mean ≈ 1.42). Poisson assumes var = mean, systematically underestimating tail probabilities. After XGBoost predicts μ, the NB dispersion α is estimated from training residuals (method of moments), and P(SOG > line) = 1 − NB_CDF(floor(line), n=1/α, p=1/(1+α·μ)) is applied analytically. This guarantees P(>1.5) ≥ P(>2.5) ≥ P(>3.5) ≥ P(>4.5) always.
 
-For each game, also compute the **opponent's** rolling stats (using the opponent's recent games). This gives the model both sides of the matchup.
+**Features:**
+- Per-player rolling SOG mean/std, icetime, xGoals, high-danger shots, Fenwick, ozone start rate (windows 5 + 10)
+- Opponent team shots-allowed per game (rolling 10)
+- Opponent goalie rolling GSAx and HD save % (rolling 10) — *the key addition that enables per-goalie adjustment beyond team-level defense*
+- Home/away flag
 
-**Head-to-Head Features (optional / stretch):**
+**Competitive-zone line selection:** Only considers lines where the model's P(over) ∈ [0.30, 0.70]. Picks the line with the highest |P − 0.50|. Identical logic to how the totals model picks 5.5 vs 6.5 vs 7.5.
 
-- `h2h_win_pct` — historical win rate of home team vs this specific opponent over the dataset
-
-**Important:** All rolling features use **only past data** for that team. Game 1 of a season will have NaN rolling features (handled via drop or imputation from the prior season's tail).
-
-### Phase 3 — Noise Reduction (`pipeline/noise_reduction.py`)
-
-NHL is a high-variance sport. Single-game stats are noisy. Noise reduction is applied **gently** — the goal is smoothing, not aggressive filtering.
-
-- **Rolling averages are the primary noise reduction** — already handled in feature engineering. Using multiple window sizes (5, 10, 15, 20) captures both short-term form and longer trends.
-- **PDO regression flag** — flag games where PDO is extreme (>105 or <95 over a window). This doesn't remove data, but adds a feature the model can learn from.
-- **Outlier softening** — for features with extreme single-game values (e.g., 12-goal games, 90%+ faceoff pct), apply winsorization at the 1st/99th percentile on the rolling averages. This prevents one fluky game from distorting the window.
-- **No rows are deleted** — noise reduction produces features or transforms values, it does not discard games.
-
-### Phase 4 — Model Training (`03_model_training.ipynb` → `models/train.py`)
-
-**Target Variable:** `result` encoded as binary (1 = home win, 0 = home loss).
-
-**Models to train and compare:**
-
-| Model | Why |
-|-------|-----|
-| **Logistic Regression** | Interpretable baseline; good at showing which features matter linearly |
-| **Random Forest** | Handles non-linear interactions, robust to noise, built-in feature importance |
-| **XGBoost** | Gradient boosting typically gives best performance on tabular data, handles class imbalance well |
-
-**Training Data:** 2021-22 through 2023-24 seasons (after feature engineering).
-
-**Hyperparameter Tuning:** Use `GridSearchCV` or `RandomizedSearchCV` with time-aware cross-validation (no shuffling — respect chronological order). Key hyperparameters to tune per model:
-
-- Logistic Regression: regularization strength (C), penalty type
-- Random Forest: n_estimators, max_depth, min_samples_leaf
-- XGBoost: learning_rate, max_depth, n_estimators, subsample, colsample_bytree
-
-### Phase 5 — Calibration (`pipeline/calibration.py`)
-
-Raw model probabilities are often poorly calibrated (e.g., when the model says "70% chance of a home win," it should actually win ~70% of the time). This matters for betting applications.
-
-- **Platt scaling** (sigmoid) — fits a logistic regression on top of model outputs
-- **Isotonic regression** — non-parametric calibration, more flexible
-- Compare calibration curves (reliability diagrams) before and after calibration
-- Calibrate on a held-out portion of the training data (not the test set)
-
-### Phase 6 — Evaluation & Sliding Window (`04_evaluation.ipynb` → `models/evaluate.py`)
-
-This is where the project validates whether the model actually works in a realistic scenario.
-
-**Sliding Window Validation:**
-
-The model is tested on the **2024-25 season** using a sliding window approach. For a given game, the model only sees the last N games of rolling features to make its prediction.
-
-```
-Example: Predicting Game 21 for Toronto
-
-  N=5:   Uses rolling features from games 16-20
-  N=10:  Uses rolling features from games 11-20
-  N=15:  Uses rolling features from games 6-20
-  N=20:  Uses rolling features from games 1-20
-```
-
-For **each value of N** (5, 10, 15, 20):
-- Walk through every eligible game in the 2024-25 season
-- Generate the rolling features using only the last N games
-- Predict win/loss using each trained model
-- Record whether the prediction was correct
-
-**Evaluation Metrics (per model, per N):**
-
-- **Accuracy** — overall correct prediction rate (must beat 54% baseline)
-- **Precision / Recall / F1** — especially important if predictions are asymmetric
-- **Brier Score** — measures probability calibration quality
-- **Log Loss** — penalizes confident wrong predictions heavily
-- **ROC-AUC** — overall discriminative ability
-
-**Output: Best N Comparison Table**
-
-```
-| Model              | N=5   | N=10  | N=15  | N=20  | Best N |
-|--------------------|-------|-------|-------|-------|--------|
-| Logistic Regression| 0.58  | 0.61  | 0.59  | 0.57  | 10     |
-| Random Forest      | 0.60  | 0.63  | 0.62  | 0.60  | 10     |
-| XGBoost            | 0.61  | 0.64  | 0.63  | 0.61  | 10     |
-```
-*(Example values — actual results will vary)*
+**Backtest results (trained 2021-24, tested 2024-25, walk-forward):**
+- AUC per line: 0.707 (o1.5) → 0.737 (o2.5) → 0.769 (o3.5) → 0.803 (o4.5)
+- Hit rate at conviction ≥ 0.12: **67.1%** (break-even at −110 odds = 52.4%)
+- ROI at conviction ≥ 0.15: **+30.6%** at flat $10 stake
 
 ---
 
-## main.py
+## Usage
 
-The final script ties everything together. It takes no notebook dependency — it imports from `pipeline/` and `models/` and runs the full flow.
-
-**What it does:**
-
-1. Loads all season CSVs via `pipeline.data_loader`
-2. Runs feature engineering via `pipeline.features`
-3. Applies noise reduction via `pipeline.noise_reduction`
-4. Trains models on 2021-22 to 2023-24 via `models.train`
-5. Calibrates probabilities via `pipeline.calibration`
-6. Runs sliding window evaluation on 2024-25 via `models.evaluate`
-7. Prints a summary: per-model, per-N accuracy table + best configuration
-8. For a specific game, prints a prediction like:
-
-```
-PREDICTION — Game 5: VEG vs SEA (2024-10-18)
-  Model: XGBoost | Window: N=10
-  Prediction: VEG WIN (home) | Confidence: 64.2%
-  Actual Result: W ✓
-```
-
-**Usage:**
+### Predict tonight's games
 
 ```bash
-python main.py
+python main.py --predict
 ```
 
-Or to predict a specific matchup at a specific game number:
+Trains on all available seasons, then outputs moneyline predictions, totals, and player props for the next scheduled games. Includes calibrated probabilities, implied edge vs market, and Kelly-sized bet recommendations.
 
 ```bash
-python main.py --team VEG --game 5
+python main.py --predict --date 2026-03-25
 ```
+
+Predict for a specific date.
+
+```bash
+python main.py --predict --props
+```
+
+Include player SOG prop predictions alongside moneyline/totals.
+
+### Backtest historical performance
+
+```bash
+python backtest.py
+```
+
+Runs two walk-forward rounds:
+- Train 2021-23 → test 2023-24
+- Train 2021-24 → test 2024-25
+
+Outputs per-model accuracy, high-confidence hit rate, cumulative ROI by month, and player props backtest results.
+
+```bash
+python backtest.py --quick          # Logistic Regression only (fast)
+python backtest.py --no-props       # Skip player props backtest
+```
+
+---
+
+## Data Sources
+
+| Data | Source | Location |
+|------|--------|----------|
+| Team game logs | MoneyPuck (`moneypuck.com`) | `data/` |
+| Per-team xGoals | MoneyPuck | `xG/` |
+| Skater game logs | MoneyPuck | `player_stats/` |
+| Goalie game logs | MoneyPuck | `goalie_stats/` |
+| NHL standings | NHL API (`api-web.nhle.com`) | `data/standings/` |
+
+Team abbreviations follow MoneyPuck conventions: Arizona → `UTA` (Utah), Vegas → `VEG`.
 
 ---
 
@@ -261,23 +166,33 @@ pandas
 numpy
 scikit-learn
 xgboost
+lightgbm
+statsmodels
+scipy
+requests
 matplotlib
 seaborn
 jupyter
+```
+
+Install with:
+
+```bash
+pip install -r requirements.txt
 ```
 
 ---
 
 ## Key Design Decisions
 
-1. **Home-only perspective.** The dataset only contains home games, so every prediction is "will the home team win?" This simplifies the problem to a clean binary classification.
+**Rolling features, not single-game stats.** NHL is the highest-variance major sport (games decided by 1–2 lucky bounces). Single-game stats are noise. Rolling windows of 5–20 games extract the underlying signal.
 
-2. **Rolling windows as the core feature strategy.** Single-game NHL stats are extremely noisy. Rolling averages over recent games are the most natural and effective way to extract signal.
+**Competitive-zone line selection.** For totals and props, the system doesn't pick the "easiest" line (e.g. always recommend UNDER 4.5 SOG at 95% confidence — that's not an edge, that's a tautology). It finds the line closest to 50/50 where the model disagrees with the market.
 
-3. **Multiple window sizes tested, not assumed.** Instead of guessing whether 5 or 20 games is the right lookback, the sliding window evaluation empirically determines the best N for each model.
+**Goalie quality is opponent context, not team context.** `opp_roll10_soa` captures team-level shot suppression; `opp_goalie_roll10_gsax` captures the *goalie's* quality independently. A leaky defensive team with an elite goalie (e.g. early-season Carolina) would mislead a model that only uses team SOA.
 
-4. **Noise reduction as feature transformation, not data removal.** No games are thrown away. Noise is handled through smoothing (rolling averages) and softening (winsorization), preserving sample size.
+**Dispersion matters for count data.** SOG follows a Negative Binomial distribution, not Poisson. Using a Poisson CDF underestimates the probability of extreme outcomes (0 SOG or 6+ SOG), which is where prop betting edge lives.
 
-5. **Calibration as a separate step.** Because the end goal involves interpreting probabilities (for betting value), the model's raw outputs are calibrated so that predicted probabilities are meaningful.
+**Calibration before edge calculation.** Raw model probabilities are not reliable for EV calculations. The pipeline applies isotonic calibration on held-out data before comparing any predicted probability to implied market odds.
 
-6. **Notebooks for development, Python files for production.** Notebooks let you explore and visualize. The clean logic lives in importable modules. `main.py` proves the pipeline works end-to-end without Jupyter.
+**Walk-forward validation only.** No cross-validation with shuffling — that would leak future information into past predictions. Every validation result in this project uses training data that precedes the test period in calendar time.

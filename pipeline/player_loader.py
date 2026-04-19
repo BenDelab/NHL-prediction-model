@@ -2,6 +2,7 @@
 Load NHL player game-by-game stats for player prop modeling.
 
 Sources: player_stats/NHL_player_*.csv  (MoneyPuck, situation='all', non-goalies)
+         goalie_stats/NHL_goalie_*.csv   (MoneyPuck, situation='all', goalies)
 
 Produces per-player per-game rows with per-player rolling features (shift-1
 so the current game's outcome is never leaked into its own features):
@@ -14,10 +15,15 @@ so the current game's outcome is never leaked into its own features):
   player_roll{w}_fenwick_mean— rolling mean unblocked shot attempts (broader than SOG)
   player_roll{w}_ozone_mean  — rolling mean offensive-zone shift-start rate
 
-Opponent context (computed from the same player data):
+Opponent context (computed from the same player data + goalie data):
   opp_roll10_soa             — opponent team's rolling shots-allowed per game (10g)
                                Higher = easier opponent for SOG (team leaks shots)
                                Lower  = tight defensive team (suppresses shooter volume)
+  opp_goalie_roll10_gsax     — opponent goalie's rolling goals saved above expected (10g)
+                               Positive = elite goalie (suppresses scoring, may reduce
+                               shot attempts); negative = weak goalie (players shoot more)
+  opp_goalie_roll10_hd_sv    — opponent goalie's rolling HD save rate (10g)
+                               High-danger save %, captures goalie quality in danger area
 
 Rolling is computed per player across all seasons (recent cross-season form
 matters more than a season-boundary reset for projecting the next game).
@@ -39,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 PLAYER_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "player_stats")
+GOALIE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "goalie_stats")
 
 _SEASON_MAP = {
     2021: "2021-22",
@@ -126,6 +133,82 @@ def load_player_all_seasons(min_icetime: int = MIN_ICETIME_SECONDS) -> pd.DataFr
     return combined
 
 
+def load_goalie_features() -> pd.DataFrame:
+    """
+    Load goalie game logs and compute per-team rolling goalie quality metrics.
+
+    Returns a DataFrame with columns:
+      team, date, opp_goalie_roll10_gsax, opp_goalie_roll10_hd_sv
+
+    These are keyed on the goalie's *team* (the defending team) so they can
+    be merged onto the player data via player.opp_team == goalie.team.
+
+    Metrics:
+      GSAx  = xGoals - goals  (positive = goalie saved more than expected)
+      HD-SV = (hd_shots - hd_goals) / max(hd_shots, 1)  (high-danger save rate)
+
+    Both are rolling-10 game means with shift(1) — no leakage.
+    """
+    pattern = os.path.join(GOALIE_DIR, "NHL_goalie_*.csv")
+    files = sorted(glob.glob(pattern))
+
+    if not files:
+        print("[player_loader] No NHL_goalie_*.csv files — goalie features disabled.")
+        return pd.DataFrame()
+
+    dfs = []
+    for path in files:
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            print(f"[player_loader] Could not read {os.path.basename(path)}: {e}")
+            continue
+
+        df = df[df["situation"] == "all"].copy()
+        if df.empty:
+            continue
+
+        df["date"] = pd.to_datetime(df["gameDate"].astype(str), format="%Y%m%d")
+        df["team"] = df["playerTeam"].replace(_RENAMES)
+        df["xGoals"]          = pd.to_numeric(df["xGoals"],          errors="coerce")
+        df["goals"]           = pd.to_numeric(df["goals"],            errors="coerce")
+        df["highDangerShots"] = pd.to_numeric(df["highDangerShots"],  errors="coerce")
+        df["highDangerGoals"] = pd.to_numeric(df["highDangerGoals"],  errors="coerce")
+
+        dfs.append(df[["team", "date", "xGoals", "goals",
+                        "highDangerShots", "highDangerGoals"]])
+
+    if not dfs:
+        return pd.DataFrame()
+
+    raw = pd.concat(dfs, ignore_index=True)
+
+    # Sum across goalies who split minutes in the same game (rare but happens)
+    game = (
+        raw.groupby(["team", "date"], as_index=False)
+           .agg(xGoals=("xGoals", "sum"), goals=("goals", "sum"),
+                highDangerShots=("highDangerShots", "sum"),
+                highDangerGoals=("highDangerGoals", "sum"))
+           .sort_values(["team", "date"])
+           .reset_index(drop=True)
+    )
+
+    game["_gsax"]   = game["xGoals"] - game["goals"]
+    game["_hd_sv"]  = (game["highDangerShots"] - game["highDangerGoals"]) / \
+                       (game["highDangerShots"].clip(lower=1))
+
+    game["opp_goalie_roll10_gsax"] = game.groupby("team")["_gsax"].transform(
+        lambda x: x.shift(1).rolling(10, min_periods=5).mean()
+    )
+    game["opp_goalie_roll10_hd_sv"] = game.groupby("team")["_hd_sv"].transform(
+        lambda x: x.shift(1).rolling(10, min_periods=5).mean()
+    )
+
+    print(f"[player_loader] Goalie features: {len(game)} team-game rows "
+          f"({game['team'].nunique()} teams).")
+    return game[["team", "date", "opp_goalie_roll10_gsax", "opp_goalie_roll10_hd_sv"]]
+
+
 def build_player_rolling_features(df: pd.DataFrame,
                                    windows: list[int] = ROLLING_WINDOWS) -> pd.DataFrame:
     """
@@ -195,6 +278,17 @@ def build_player_rolling_features(df: pd.DataFrame,
         suffixes=("", "_opp"),
     ).drop(columns=["team_opp"])
 
+    # ── Opponent goalie quality ───────────────────────────────────────────────
+    goalie_feats = load_goalie_features()
+    if not goalie_feats.empty:
+        df = df.merge(
+            goalie_feats,
+            left_on=["opp_team", "date"],
+            right_on=["team", "date"],
+            how="left",
+            suffixes=("", "_gf"),
+        ).drop(columns=["team_gf"])
+
     return df
 
 
@@ -216,6 +310,9 @@ def get_prop_feature_cols(df: pd.DataFrame) -> list[str]:
         "player_roll10_ozone_mean",
         # Opponent defensive context
         "opp_roll10_soa",
+        # Opponent goalie quality
+        "opp_goalie_roll10_gsax",
+        "opp_goalie_roll10_hd_sv",
         # Game context
         "is_home",
     ]
@@ -255,12 +352,13 @@ def get_current_player_stats(df: pd.DataFrame,
         .reset_index()
     )
 
-    # Inject tonight's opponent context
-    if opp_team is not None and "opp_roll10_soa" in df.columns:
+    # Inject tonight's opponent context (SOA + goalie quality)
+    if opp_team is not None:
         opp_rows = df[df["opp_team"] == opp_team].sort_values("date")
         if not opp_rows.empty:
-            latest_opp_soa = opp_rows["opp_roll10_soa"].dropna().iloc[-1] \
-                if opp_rows["opp_roll10_soa"].notna().any() else np.nan
-            latest["opp_roll10_soa"] = latest_opp_soa
+            for col in ("opp_roll10_soa", "opp_goalie_roll10_gsax",
+                        "opp_goalie_roll10_hd_sv"):
+                if col in df.columns and opp_rows[col].notna().any():
+                    latest[col] = opp_rows[col].dropna().iloc[-1]
 
     return latest
