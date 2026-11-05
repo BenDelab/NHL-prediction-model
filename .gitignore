@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+.vscode/
+.DS_Store
+runs/*
+!runs/report*.json
+!runs/search.csv
+/legacy/
+/player_stats/
+/data/
+/to_clean/
