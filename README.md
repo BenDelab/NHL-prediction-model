@@ -54,7 +54,7 @@ home team's past games ──> shared CNN encoder ──> home encoding ─┐
 away team's past games ──> shared CNN encoder ──> away encoding ─┘
 ```
 
-**Inputs.** Each team's sequence holds its games so far this season, oldest first. Each game has 17 stats: home or away, win, score-and-venue-adjusted xG for and against (all situations and 5-on-5), Corsi, power-play and penalty-kill xG, goals for and against, goalie saves above expected, finishing, penalties, opponent Elo, rest and travel. Ten pre-game context values are added, including Elo difference, rest, back-to-backs, travel and recent workload. Era scaling is an option that validation can choose: it expresses stats relative to the league's level that season, using earlier dates only.
+**Inputs.** Each team's sequence holds its games so far this season, oldest first. Each game has 17 stats: home or away, win, score-and-venue-adjusted xG for and against (all situations and 5-on-5), Corsi, power-play and penalty-kill xG, goals for and against, goalie saves above expected, finishing, penalties, opponent Elo, rest and travel. Ten pre-game context values are added, including Elo difference, rest, back-to-backs, travel and recent workload. Era scaling is an option that validation can choose: it expresses stats relative to the league's level that season, using earlier dates only. All inputs to both models are standardized (z-scores) using training games only.
 
 **Network.** One encoder reads both teams, so both are judged by the same rules. Short kernels slide along the sequence, and two convolution layers feed average and latest-position pooling. The hidden layers use nonlinear GELU activations, with a sigmoid only at the output, so this is a genuinely different model from logistic regression rather than a more complicated version of it. Each reported prediction averages 5 training runs with different random seeds.
 
@@ -103,6 +103,8 @@ Differences between models use a 95% bootstrap range over game dates. Log loss i
 | **CNN, tuned** | 61.0% | 0.6554 | 0.646 |
 | **Tuned models averaged** | 60.2% | 0.6540 | 0.647 |
 
+These are the project's final results. The 95% log loss ranges are 0.635 to 0.676 for logistic regression, 0.639 to 0.675 for the CNN, and 0.637 to 0.674 for the average.
+
 | Comparison | Log loss change | 95% range | Reading |
 |---|---|---|---|
 | CNN vs logistic regression, both tuned | +0.0016 | -0.0061 to +0.0095 | **No clear winner** |
@@ -111,7 +113,7 @@ Differences between models use a 95% bootstrap range over game dates. Log loss i
 
 The accuracy gap is five games: the CNN got 150 right and logistic regression got 145. These numbers are higher than in the development seasons, but they cover only the first weeks of one season, so that shouldn't be read as the model improving.
 
-Validation chose a CNN starting in 2008 with no fading or era scaling, 20-game sequences and kernels of 3 + 5. Logistic regression chose a 2008 start with no fading, era scaling on and `C` of 0.0003. The CNN's training length came from its 2025-26 validation runs, which did best after one pass through the data, so the final CNN models each trained for only one pass.
+Validation chose a CNN starting in 2008 with no fading or era scaling, 20-game sequences and kernels of 3 + 5. Logistic regression chose a 2008 start with no fading, era scaling on and `C` of 0.0003. The CNN's training length came from its 2025-26 validation runs, which did best after one pass through the data, so the final CNN models each trained for only one pass. A later check on the validation seasons showed this cost very little (see below).
 
 ### Development seasons
 
@@ -202,6 +204,14 @@ Each cell shows accuracy and log loss. These runs used 5 seeds instead of 10 and
 
 Going from 2021-22 to 2008-09 improved log loss by about 0.0025 for all three models. The improvement is clear for the CNN (-0.0048 to -0.0002) and the average (-0.0048 to -0.0001), and just misses for logistic regression (-0.0054 to +0.0004). Extra data didn't separate the models: with everything back to 2008-09, the CNN and logistic regression are still tied (+0.0002, range -0.0021 to +0.0025). The tuned results above chose the training start on validation seasons, and always chose 2008 or 2013.
 
+**Would more training passes help?** No. This check came after the final test and used only the 2024-25 and 2025-26 validation seasons, with the setup chosen for 2026-27 and three seeds. The final results weren't rerun.
+
+| Training passes | 1 | 2 | 5 | 10 | 25 |
+|---|---|---|---|---|---|
+| Average validation log loss | 0.6722 | 0.6716 | 0.6724 | 0.6732 | 0.6747 |
+
+At a slower learning rate (0.0003), the best point moved to 6 passes with about the same score (0.6714). Extra passes reuse the same games rather than adding new information, and past the first few the model starts fitting noise.
+
 **Does knowing the starting goalie help?** Not overall. This test used the 2021-22 onward setup, without era handling or retraining. Adding each official starter's record from earlier games only made no reliable difference:
 
 | Model | Accuracy without → with | Log loss without → with | Log loss change [95% range] |
@@ -244,7 +254,7 @@ python3 -m venv .venv
 .venv/bin/python -m nhl.tuned_experiment        # final test on 2026-27 (about 45 minutes)
 ```
 
-Results are written to `runs/`. The other experiments cover the finished seasons only.
+Results are written to `runs/`. `report_tuned.json` holds the final 2026-27 results, and `report_tuned_development.json` holds the three-output development results. The other experiments cover the finished seasons only.
 
 ## Project layout
 
